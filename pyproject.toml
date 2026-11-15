@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agy-profiles"
+version = "0.1.0"
+description = "Clean-room multi-profile sandbox manager, stdio MCP server, and CSRF-hardened local console for Google Antigravity"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+authors = [
+  { name = "harrymove-ctrl" }
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+  "Topic :: Utilities"
+]
+
+[project.urls]
+Homepage = "https://github.com/harrymove-ctrl/agy-profiles"
+Repository = "https://github.com/harrymove-ctrl/agy-profiles"
+
+[project.scripts]
+agy-profiles = "agy_profiles.cli:main"
+agyp = "agy_profiles.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agy_profiles = ["web_static/*"]

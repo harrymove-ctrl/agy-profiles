@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.13"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Verify executable wrappers and installer dry-run
+        run: |
+          test -x bin/agy-profiles
+          test -x bin/agyp
+          bash install.sh --dry-run
+
+      - name: Run unit and integration tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Verify live security obligations
+        run: |
+          TMP_ROOT="$(mktemp -d)"
+          AGY_PROFILES_DIR="$TMP_ROOT" ./bin/agy-profiles doctor --json
+          AGY_PROFILES_DIR="$TMP_ROOT" ./bin/agy-profiles obligations --json
+          rm -rf "$TMP_ROOT"
+
+      - name: Run secret, CJK, and clean-room scanner
+        run: python3 scripts/check_secrets.py
