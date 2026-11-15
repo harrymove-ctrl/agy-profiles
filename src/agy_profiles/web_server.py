@@ -26,7 +26,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "web_static"
 CSP_POLICY = (
     "default-src 'none'; "
     "script-src 'self'; "
-    "style-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "font-src 'self'; "
     "img-src 'self' data:; "
     "connect-src 'self'; "
     "frame-ancestors 'none'; "
@@ -164,9 +165,10 @@ def _unauthorized_html() -> bytes:
         "<html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<title>AGY Profiles Authentication Required</title>"
         "<style>"
-        "body{margin:0;background:#0b0e13;color:#e8eef5;font:14px/1.6 system-ui,-apple-system,sans-serif;display:grid;place-items:center;min-height:100vh}"
-        ".card{max-width:460px;background:#11161e;border:1px solid #222b38;border-radius:10px;padding:24px}"
-        "h1{margin:0 0 8px;font-size:16px}p{margin:0;color:#94a3b8}"
+        "body{margin:0;background:#f7f5f0;color:#1c1917;font:14px/1.6 system-ui,-apple-system,sans-serif;display:grid;place-items:center;min-height:100vh}"
+        ".card{max-width:460px;background:#ffffff;border:1px solid #e5e0d8;border-radius:12px;padding:28px;box-shadow:0 8px 24px rgba(28,25,23,0.06)}"
+        "h1{margin:0 0 8px;font-size:18px;font-weight:600;color:#1c1917}p{margin:0;color:#57534e}"
+        "code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f1ede4;padding:2px 6px;border-radius:4px;color:#9a3412}"
         "</style></head><body><div class=\"card\">"
         "<h1>Session Token Required</h1>"
         "<p>Open the tokenized URL printed in your terminal running <code>agy-profiles web</code> to start a local console session.</p>"
@@ -313,6 +315,36 @@ class HardenedWebHandler(BaseHTTPRequestHandler):
             return
         self._send_bytes(200, content_type, asset_path.read_bytes())
 
+    def _serve_font_asset(self, path: str) -> None:
+        raw_rel = unquote(path[len("/fonts/"):])
+        if (
+            not raw_rel
+            or "/" in raw_rel
+            or "\\" in raw_rel
+            or ".." in raw_rel
+            or "\x00" in raw_rel
+        ):
+            self._send_json(404, ToolError("not_found", "Font asset not found.", http_status=404).to_dict())
+            return
+        if raw_rel.endswith(".woff2"):
+            content_type = "font/woff2"
+        elif raw_rel.endswith(".woff"):
+            content_type = "font/woff"
+        else:
+            self._send_json(404, ToolError("not_found", "Font asset not found.", http_status=404).to_dict())
+            return
+        fonts_root = (STATIC_DIR / "fonts").resolve()
+        candidate = (fonts_root / raw_rel).resolve()
+        if candidate.parent != fonts_root or not candidate.is_file():
+            self._send_json(404, ToolError("not_found", "Font asset not found.", http_status=404).to_dict())
+            return
+        self._send_bytes(
+            200,
+            content_type,
+            candidate.read_bytes(),
+            extra_headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
+
     def do_GET(self) -> None:
         if not self._check_host_or_reject():
             return
@@ -353,6 +385,9 @@ class HardenedWebHandler(BaseHTTPRequestHandler):
             return
         if path == "/mark.svg":
             self._serve_static_asset("mark.svg", "image/svg+xml")
+            return
+        if path.startswith("/fonts/"):
+            self._serve_font_asset(path)
             return
 
         if not path.startswith("/api/"):

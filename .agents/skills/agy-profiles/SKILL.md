@@ -13,7 +13,7 @@ Use this skill when isolating Google Antigravity workspaces, debugging stale Chr
 2. Creating a fresh sandbox for untrusted repository inspection (`--links none`, no host `.ssh`, `.aws`, or `.gemini` symlinks).
 3. Inheriting host `GEMINI.md` and `mcp_config.json` into a new sandbox safely using fail-closed secret scrubbing (`--inherit-config`).
 4. Repairing crashed Electron lock files (`SingletonLock`, `SingletonSocket`, `SingletonCookie`, `DevToolsActivePort`) without terminating unrelated Antigravity instances.
-5. Opening the CSRF-guarded local Web Console (`agy-profiles web`) or running the stdio MCP server (`agy-profiles mcp`).
+5. Opening the CSRF-guarded Astryx Design System local Web Console (`agy-profiles web`) or running the stdio MCP server (`agy-profiles mcp`). The Web Console includes five Astryx palettes (`Stone`, `Chocolate`, `Gothic`, `Matcha`, `Neutral`), Light and Dark mode toggles, keyboard shortcuts (`/` filter, `n` create profile drawer, `r` refresh), and live `Profiles`, `Obligations`, and `Doctor` views.
 
 ## Recommended Command Sequence
 
@@ -37,3 +37,7 @@ Use this skill when isolating Google Antigravity workspaces, debugging stale Chr
 2. Never allow `--root` operations to escape profile containment via relative segments or symlinks.
 3. Never fall back to raw file copy if host `mcp_config.json` fails strict JSON validation (`mcp_config_malformed`).
 4. Never bind the local Web Console beyond `127.0.0.1` or `::1`.
+
+## Local Web Console Customization
+
+When editing UI components, themes (`Stone`, `Chocolate`, `Gothic`, `Matcha`, `Neutral`), or typography inside `web-ui/`, run `cd web-ui && npm run build` to recompile `src/agy_profiles/web_static/` (`index.html`, `styles.css`, `app.js`, `mark.svg`, `fonts/*.woff2`) and keep `fonts.googleapis.com` completely absent from the built CSS.

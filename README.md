@@ -18,7 +18,7 @@ This repository is built purely on the Python 3 standard library (`>= 3.9`) with
 4. **Symlink Allowlist and Blocklist**: Rejects and strips symlinks pointing to sensitive host locations (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.npmrc`, `.netrc`, `.pypirc`, `Library/Keychains`, `.gemini`, shell startup dotfiles). Offers conservative opt-in link policies (`none`, `minimal`, `dev`) for benign runtime binaries and fonts.
 5. **Exact Process Boundary Matching**: Tracks and stops processes only when `--user-data-dir=<resolved_path>` matches at strict token boundaries, including descendant child processes discovered via parent-PID traversal. Escalates cleanly from `SIGTERM` to `SIGKILL` and repairs stale Chromium locks (`SingletonLock`, `SingletonSocket`, `SingletonCookie`, `DevToolsActivePort`).
 6. **Evidence and Obligation Ledgers**: Emits structured `EvidenceRecord` metadata (`evidence_id`, `authority`, `confidence`, `facts`, `limitations`) on inspections and exposes six executable security self-checks via `agy-profiles obligations`.
-7. **Three Zero-Dependency Surfaces**: Includes an `argparse` CLI (`agy-profiles` / `agyp`), a line-delimited JSON-RPC 2.0 stdio MCP server (`agy-profiles mcp`), a native macOS `.app` launcher compiler (`agy-profiles launcher build`), and a Dark/Light CSP-enforced Web Console (`agy-profiles web`).
+7. **Zero-Dependency Local Surfaces**: Includes an `argparse` CLI (`agy-profiles` / `agyp`), a line-delimited JSON-RPC 2.0 stdio MCP server (`agy-profiles mcp`), a native macOS `.app` launcher compiler (`agy-profiles launcher build`), and an Astryx Design System Web Console (`agy-profiles web`) with five curated palettes (`Stone`, `Chocolate`, `Gothic`, `Matcha`, `Neutral`), Light and Dark modes, and self-hosted variable fonts.
 
 ## Installation
 
@@ -95,6 +95,24 @@ agy-profiles web
   }
 }
 ```
+
+## Web Console and Frontend Build
+
+The local Web Console (`agy-profiles web`) is built with React 19, TypeScript, `@astryxdesign/core`, and `@stylexjs/stylex` from `web-ui/`, then pre-compiled with Vite into `src/agy_profiles/web_static/` (`index.html`, `styles.css`, `app.js`, `mark.svg`, `fonts/*.woff2`) so end users install and run `agy-profiles` with zero Node or PyPI runtime dependencies.
+
+1. **Astryx Design System & Themes**: Uses the warm `Stone` palette by default alongside `Chocolate`, `Gothic`, `Matcha`, and `Neutral` themes, Light and Dark appearance switching, and six profile accent presets.
+2. **Self-Hosted Variable Typography**: Bundles `Fraunces Variable`, `Figtree Variable`, and `JetBrains Mono Variable` `.woff2` font files directly inside `src/agy_profiles/web_static/fonts/` with zero external `fonts.googleapis.com` requests.
+3. **Interactive Console Workflows**: Provides `TopNav` and `SideNav` switching across `Profiles`, `Obligations`, and `Doctor`, searchable profile table and inspector actions, a profile creation `Drawer`, confirmation controls, and keyboard shortcuts (`/` to filter profiles, `n` to open Create Profile, `r` to refresh live state).
+4. **Loopback & CSP Hardening**: Binds strictly to `127.0.0.1` or `::1`, authenticates requests via single-use bootstrap token and `X-AGY-CSRF`, enforces `script-src 'self'` and `font-src 'self'`, and isolates `/fonts/` static serving with single-segment extension checks.
+5. **Rebuilding Frontend Assets (Optional Dev Only)**:
+
+```bash
+cd web-ui
+npm install
+npm run build
+```
+
+This updates `src/agy_profiles/web_static/` directly for packaging and verification (`docs/assets/web-console-overview.png`).
 
 ## CLI Command Reference
 

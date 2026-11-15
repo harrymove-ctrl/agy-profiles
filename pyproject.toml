@@ -41,4 +41,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-agy_profiles = ["web_static/*"]
+agy_profiles = ["web_static/*", "web_static/fonts/*"]

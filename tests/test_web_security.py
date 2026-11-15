@@ -66,6 +66,7 @@ class WebSecurityTests(unittest.TestCase):
         csp = headers.get("Content-Security-Policy", "")
         self.assertIn("default-src 'none'", csp)
         self.assertIn("script-src 'self'", csp)
+        self.assertIn("font-src 'self'", csp)
         self.assertIn("frame-ancestors 'none'", csp)
         self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
         self.assertEqual(headers.get("X-Frame-Options"), "DENY")
@@ -206,6 +207,20 @@ class WebSecurityTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["deleted"])
+
+    def test_font_route_containment_and_mime(self) -> None:
+        status, headers, body = self._request("GET", "/fonts/fraunces-latin-wght-normal.woff2")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), "font/woff2")
+        self.assertGreater(len(body), 1000)
+
+        for bad_path in (
+            "/fonts/../index.html",
+            "/fonts/%2e%2e/app.js",
+            "/fonts/missing.woff2",
+        ):
+            status, _, _ = self._request("GET", bad_path)
+            self.assertEqual(status, 404, msg="Expected 404 for {}".format(bad_path))
 
 
 if __name__ == "__main__":

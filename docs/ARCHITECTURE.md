@@ -10,7 +10,7 @@
 | `L1` | `config.py` | Slug validation, root resolution, symlink containment checks, atomic `0o600` file writes, host app bundle detection, and `ProfileManifest` persistence. |
 | `L2` | `isolation.py`, `process_guard.py`, `macos_launcher.py` | Directory provisioning, `.zshenv` `HOME` rewriting, link blocklists, fail-closed MCP secret scrubbing, exact PID boundary matching, lock repair, and AppleScript `.app` compilation. |
 | `L3` | `tools.py` | Shared `RuntimeContext`, `ToolSpec` JSON schemas, all 13 operational handlers, and the six live `obligations_verify` self-checks. |
-| `L4` | `cli.py`, `mcp_server.py`, `web_server.py`, `web_static/` | `argparse` CLI, stdio JSON-RPC 2.0 MCP server, and loopback HTTP console with browser assets. |
+| `L4` | `cli.py`, `mcp_server.py`, `web_server.py`, `web_static/` | `argparse` CLI, stdio JSON-RPC 2.0 MCP server, and loopback HTTP console serving pre-compiled Astryx React assets from `web-ui/`. |
 
 ## On-Disk Profile Layout
 
@@ -34,3 +34,11 @@ Desktop Electron hosts on macOS commonly spawn interactive login shells (`$SHELL
 ## Upgrade Cache Hygiene
 
 Before launching a profile, `purge_stale_caches_if_upgraded` compares the host bundle's `CFBundleShortVersionString` against `manifest.last_host_versions`. When the host binary version changes, volatile Chromium GPU and shader caches (`Cache`, `Code Cache`, `GPUCache`, `DawnGraphiteCache`, `DawnWebGPUCache`, `GraphiteDawnCache`) are cleared cleanly while preserving user configuration, workspace state, and OAuth tokens.
+
+## Web Console Frontend Build Architecture
+
+The user interface served by `web_server.py` originates in `web-ui/`, a TypeScript + React 19 + `@astryxdesign/core` + `@stylexjs/stylex` Vite project using an IIFE bundle (`vite.config.ts`) targeting `src/agy_profiles/web_static/`.
+
+1. **Zero Runtime Footprint**: `node_modules` and `web-ui/.astryx` remain excluded in `.gitignore`. Python packaging in `pyproject.toml` distributes only the compiled `web_static/*` and `web_static/fonts/*` files with `dependencies = []`.
+2. **Self-Hosted Font Pipeline**: `@fontsource-variable/fraunces`, `@fontsource-variable/figtree`, and `@fontsource-variable/jetbrains-mono` Latin `.woff2` subsets are copied into `src/agy_profiles/web_static/fonts/` via `vite.config.ts` and scoped per `[data-astryx-theme]` in `web-ui/src/styles/self-hosted-fonts.css`, guaranteeing zero external font CDN calls.
+3. **Static Route Containment**: `web_server.py` serves `/`, `/app.js`, `/styles.css`, `/mark.svg`, and `/fonts/<name>.woff2` directly from `STATIC_DIR` with strict path containment and `font-src 'self'`, `script-src 'self'`, `style-src 'self' 'unsafe-inline'` (needed by Astryx runtime styling).
