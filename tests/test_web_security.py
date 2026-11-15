@@ -198,6 +198,31 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("checks", json.loads(body))
 
+        status, _, body = self._request("GET", "/api/handoff?limit=5", headers={"Cookie": cookie, "X-AGY-CSRF": csrf})
+        self.assertEqual(status, 200)
+        handoff_payload = json.loads(body)
+        self.assertIn("available", handoff_payload)
+        self.assertIn("conversations", handoff_payload)
+
+        status, _, _ = self._request(
+            "POST",
+            "/api/profiles/alpha/sync",
+            headers={"Cookie": cookie, "Origin": self.sec.expected_origin},
+            body={"include_sidecars": False, "include_handoff": False},
+        )
+        self.assertEqual(status, 403)
+
+        status, _, body = self._request(
+            "POST",
+            "/api/profiles/alpha/sync",
+            headers={"Cookie": cookie, "X-AGY-CSRF": csrf, "Origin": self.sec.expected_origin},
+            body={"include_sidecars": False, "include_handoff": False},
+        )
+        self.assertEqual(status, 200)
+        sync_payload = json.loads(body)
+        self.assertIn("sync", sync_payload)
+        self.assertEqual(sync_payload["manifest"]["name"], "alpha")
+
         # Delete
         status, _, body = self._request(
             "DELETE",
@@ -209,7 +234,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(json.loads(body)["deleted"])
 
     def test_font_route_containment_and_mime(self) -> None:
-        status, headers, body = self._request("GET", "/fonts/fraunces-latin-wght-normal.woff2")
+        status, headers, body = self._request("GET", "/fonts/fustat-latin-wght-normal.woff2")
         self.assertEqual(status, 200)
         self.assertEqual(headers.get("Content-Type"), "font/woff2")
         self.assertGreater(len(body), 1000)

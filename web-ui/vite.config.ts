@@ -2,18 +2,16 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "node:path";
 
-const selfHostedFontsCss = path.resolve(__dirname, "src/styles/self-hosted-fonts.css");
 const emptyCss = path.resolve(__dirname, "src/styles/empty.css");
 
 export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
-      "@astryxdesign/theme-stone/fonts.css": selfHostedFontsCss,
-      "@astryxdesign/theme-chocolate/fonts.css": emptyCss,
       "@astryxdesign/theme-gothic/fonts.css": emptyCss,
-      "@astryxdesign/theme-matcha/fonts.css": emptyCss,
       "@astryxdesign/theme-neutral/fonts.css": emptyCss,
+      "./themes/gothic-studio/gothic-studio.fonts.css": emptyCss,
+      [path.resolve(__dirname, "src/themes/gothic-studio/gothic-studio.fonts.css")]: emptyCss,
     },
   },
   esbuild: {

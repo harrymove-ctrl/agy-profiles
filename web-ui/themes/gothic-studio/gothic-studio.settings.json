@@ -1,0 +1,40 @@
+{
+  "name": "gothic-studio",
+  "like": "gothic",
+  "mode": "both",
+  "settings": [
+    {
+      "thing": "text-size",
+      "value": "medium",
+      "source": "dial"
+    },
+    {
+      "thing": "type",
+      "value": "standard",
+      "source": "dial"
+    },
+    {
+      "thing": "headings",
+      "value": "semibold",
+      "source": "dial",
+      "axis": "weight"
+    },
+    {
+      "thing": "headings",
+      "value": "tight",
+      "source": "dial",
+      "axis": "tracking"
+    },
+    {
+      "thing": "surfaces",
+      "value": "outlined",
+      "source": "dial"
+    },
+    {
+      "thing": "corners",
+      "value": "small",
+      "source": "dial"
+    }
+  ],
+  "lifted": []
+}

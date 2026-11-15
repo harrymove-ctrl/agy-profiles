@@ -5,10 +5,11 @@ import { Code } from "@astryxdesign/core/Code";
 import { EmptyState } from "@astryxdesign/core/EmptyState";
 import { Heading } from "@astryxdesign/core/Heading";
 import { HStack } from "@astryxdesign/core/HStack";
-import { Layout, LayoutContent } from "@astryxdesign/core/Layout";
+import { Layout, LayoutContent, LayoutHeader } from "@astryxdesign/core/Layout";
 import { StatusDot } from "@astryxdesign/core/StatusDot";
 import { Table, pixel, proportional, type TableColumn } from "@astryxdesign/core/Table";
 import { Text } from "@astryxdesign/core/Text";
+import { Timestamp } from "@astryxdesign/core/Timestamp";
 import { VStack } from "@astryxdesign/core/VStack";
 import type { ObligationItem, ObligationsResponse } from "../types";
 
@@ -29,12 +30,13 @@ const columns: TableColumn<ObligationItem>[] = [
         <HStack gap={1.5} vAlign="center">
           <StatusDot
             variant={closed ? "success" : "error"}
-            label={item.status}
+            label={closed ? "Verified" : "Failed"}
           />
-          <Badge
-            variant={closed ? "success" : "error"}
-            label={item.status}
-          />
+          {closed ? (
+            <Text weight="medium">Verified</Text>
+          ) : (
+            <Badge variant="error" label="Failed" />
+          )}
         </HStack>
       );
     },
@@ -102,14 +104,14 @@ export function ObligationsStage({
               headingLevel={1}
               title={
                 loading
-                  ? "Verifying security obligations..."
-                  : "Security obligation ledger unavailable"
+                  ? "Verifying obligations..."
+                  : "Obligation report unavailable"
               }
-              description="Run live self-checks against slug validation, path containment, symlink boundaries, MCP secret scrubbing, and web origin guards."
+              description="Run live checks on slug rules, path containment, symlinks, redaction, and CSRF."
               actions={
                 <Button
                   variant="primary"
-                  label="Verify Obligations"
+                  label="Run Checks"
                   isLoading={loading}
                   onClick={onRefresh}
                 />
@@ -127,49 +129,58 @@ export function ObligationsStage({
     <Layout
       padding={6}
       height="fill"
+      header={
+        <LayoutHeader hasDivider>
+          <HStack hAlign="between" vAlign="center" gap={4} wrap="wrap">
+            <VStack gap={1}>
+              <HStack gap={2} vAlign="center" wrap="wrap">
+                <Heading level={1}>Security Obligations</Heading>
+                <StatusDot
+                  variant={allClosed ? "success" : "error"}
+                  label={allClosed ? "All verified" : "Failed"}
+                />
+                {report.summary.failed > 0 ? (
+                  <Badge
+                    variant="error"
+                    label={`${report.summary.failed} Failed`}
+                  />
+                ) : null}
+              </HStack>
+              <Text type="supporting" color="secondary" hasTabularNumbers>
+                {report.summary.closed} of {report.summary.total} verified ·{" "}
+                {report.ledger_id} ·{" "}
+                <Timestamp
+                  value={report.verified_at}
+                  format="date_time"
+                  timezoneID="UTC"
+                  isTimezoneShown
+                />
+              </Text>
+            </VStack>
+
+            <Button
+              size="sm"
+              variant="secondary"
+              label="Run Checks"
+              tooltip="Re-run checks (R)"
+              isLoading={loading}
+              onClick={onRefresh}
+            />
+          </HStack>
+        </LayoutHeader>
+      }
       content={
         <LayoutContent>
-          <VStack gap={4}>
-            <Card padding={5}>
-              <HStack hAlign="between" vAlign="center" gap={4} wrap="wrap">
-                <VStack gap={1.5}>
-                  <HStack gap={2} vAlign="center" wrap="wrap">
-                    <Heading level={1}>Security &amp; Isolation Obligations</Heading>
-                    <Badge
-                      variant={allClosed ? "success" : "error"}
-                      label={
-                        allClosed
-                          ? `All ${report.summary.closed}/${report.summary.total} Closed`
-                          : `${report.summary.failed} Failed`
-                      }
-                    />
-                    <Code>{report.ledger_id}</Code>
-                  </HStack>
-                  <Text type="supporting" color="secondary" hasTabularNumbers>
-                    Verified live against package modules at {report.verified_at}
-                  </Text>
-                </VStack>
-
-                <Button
-                  variant="secondary"
-                  label="Re-verify All"
-                  isLoading={loading}
-                  onClick={onRefresh}
-                />
-              </HStack>
-            </Card>
-
-            <Card padding={0}>
-              <Table
-                data={report.items}
-                columns={columns}
-                idKey="obligation_id"
-                density="balanced"
-                dividers="rows"
-                hasHover
-              />
-            </Card>
-          </VStack>
+          <Card padding={0}>
+            <Table
+              data={report.items}
+              columns={columns}
+              idKey="obligation_id"
+              density="balanced"
+              dividers="rows"
+              hasHover
+            />
+          </Card>
         </LayoutContent>
       }
     />

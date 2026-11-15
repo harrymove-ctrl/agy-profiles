@@ -28,8 +28,8 @@ import type {
   UpdateProfilePayload,
 } from "./types";
 
-const THEME_STORAGE_KEY = "agyp-astryx-theme";
-const MODE_STORAGE_KEY = "agyp-color-scheme";
+const THEME_STORAGE_KEY = "agyp-astryx-theme-v2";
+const MODE_STORAGE_KEY = "agyp-color-scheme-v2";
 
 function readStoredTheme(): ThemeSlug {
   try {
@@ -52,11 +52,12 @@ function readStoredMode(): "light" | "dark" {
   } catch {
     // Ignore storage read failures.
   }
-  return "light";
+  return "dark";
 }
 
 interface ConsoleShellProps {
   themeSlug: ThemeSlug;
+  isDarkOnlyTheme: boolean;
   resolvedMode: "light" | "dark";
   onThemeChange: (slug: ThemeSlug) => void;
   onToggleColorMode: () => void;
@@ -64,6 +65,7 @@ interface ConsoleShellProps {
 
 function ConsoleShell({
   themeSlug,
+  isDarkOnlyTheme,
   resolvedMode,
   onThemeChange,
   onToggleColorMode,
@@ -93,8 +95,10 @@ function ConsoleShell({
   const reportError = useCallback(
     (err: unknown, fallback: string) => {
       if (err instanceof ApiClientError) {
-        const suffix = err.remediation ? ` — ${err.remediation}` : "";
-        toast({ body: `${err.message}${suffix}`, type: "error" });
+        const detailText = err.remediation
+          ? `${err.message.replace(/\.$/, "")}. ${err.remediation}`
+          : err.message;
+        toast({ body: detailText, type: "error" });
         return;
       }
       toast({
@@ -191,6 +195,11 @@ function ConsoleShell({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && confirmDeleteOpen) {
+        setConfirmDeleteOpen(false);
+        return;
+      }
+
       const active = document.activeElement as HTMLElement | null;
       const tag = active?.tagName ?? "";
       const isEditing =
@@ -199,23 +208,60 @@ function ConsoleShell({
         tag === "SELECT" ||
         Boolean(active?.isContentEditable);
 
-      if (event.key === "/" && !isEditing && !createOpen && !cloneOpen) {
-        event.preventDefault();
-        setView("profiles");
-        window.setTimeout(() => {
-          searchInputRef.current?.focus();
-        }, 0);
+      if (
+        isEditing ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey ||
+        createOpen ||
+        cloneOpen ||
+        confirmDeleteOpen
+      ) {
         return;
       }
 
-      if (event.key === "Escape" && confirmDeleteOpen) {
-        setConfirmDeleteOpen(false);
+      if (event.key === "/") {
+        event.preventDefault();
+        setView("profiles");
+        if (searchInputRef.current) {
+          searchInputRef.current.focus();
+        } else {
+          window.setTimeout(() => {
+            searchInputRef.current?.focus();
+          }, 0);
+        }
+        return;
+      }
+
+      if (event.key === "n") {
+        event.preventDefault();
+        setCreateOpen(true);
+        return;
+      }
+
+      if (event.key === "r") {
+        event.preventDefault();
+        if (view === "profiles") {
+          void refreshState();
+        } else if (view === "obligations") {
+          void loadObligations();
+        } else {
+          void loadDoctor();
+        }
       }
     };
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [cloneOpen, confirmDeleteOpen, createOpen]);
+  }, [
+    cloneOpen,
+    confirmDeleteOpen,
+    createOpen,
+    loadDoctor,
+    loadObligations,
+    refreshState,
+    view,
+  ]);
 
   const handleSelectProfile = useCallback(
     (name: string) => {
@@ -232,7 +278,7 @@ function ConsoleShell({
       body: payload,
     });
     toast({
-      body: `Provisioned isolated sandbox "${created.manifest.name}".`,
+      body: `Created profile ${created.manifest.name}.`,
       type: "info",
     });
     await refreshState(created.manifest.name);
@@ -250,7 +296,7 @@ function ConsoleShell({
       }
     );
     toast({
-      body: `Cloned sandbox "${source}" to "${cloned.manifest.name}".`,
+      body: `Cloned ${source} to ${cloned.manifest.name}.`,
       type: "info",
     });
     await refreshState(cloned.manifest.name);
@@ -272,7 +318,7 @@ function ConsoleShell({
       toast({
         body: res.already_running
           ? `${name} (${target.toUpperCase()}) is already running.`
-          : `Launched ${name} (${target.toUpperCase()}) at PID ${res.pid ?? "started"}.`,
+          : `Started ${name} (${target.toUpperCase()}, PID ${res.pid ?? "active"}).`,
         type: "info",
       });
       await refreshState(name);
@@ -290,7 +336,7 @@ function ConsoleShell({
         method: "POST",
         body: { target: "all" },
       });
-      toast({ body: `Stopped processes for "${name}".`, type: "info" });
+      toast({ body: `Stopped ${name}.`, type: "info" });
       await refreshState(name);
     } catch (err) {
       reportError(err, `Failed to stop ${name}.`);
@@ -307,7 +353,7 @@ function ConsoleShell({
         body: {},
       });
       toast({
-        body: `Reconciled permissions and locks for "${name}".`,
+        body: `Repaired locks and permissions for ${name}.`,
         type: "info",
       });
       await refreshState(name);
@@ -331,8 +377,8 @@ function ConsoleShell({
       });
       toast({
         body: remove
-          ? `Removed ${target.toUpperCase()} desktop launcher for "${name}".`
-          : `Built macOS .app launcher for "${name}" (${target.toUpperCase()}).`,
+          ? `Removed ${target.toUpperCase()} launcher for ${name}.`
+          : `Built ${target.toUpperCase()} .app launcher for ${name}.`,
         type: "info",
       });
       await refreshState(name);
@@ -357,7 +403,7 @@ function ConsoleShell({
         }
       );
       toast({
-        body: `Saved isolation policy for "${name}".`,
+        body: `Saved policy for ${name}.`,
         type: "info",
       });
       await refreshState(name);
@@ -376,10 +422,10 @@ function ConsoleShell({
         body: { force_stop: forceStop },
       });
       setConfirmDeleteOpen(false);
-      toast({ body: `Deleted sandbox profile "${name}".`, type: "info" });
+      toast({ body: `Deleted profile ${name}.`, type: "info" });
       await refreshState(null);
     } catch (err) {
-      reportError(err, `Failed to delete "${name}".`);
+      reportError(err, `Failed to delete ${name}.`);
     } finally {
       setActionBusy(null);
     }
@@ -402,6 +448,7 @@ function ConsoleShell({
             profileCount={profiles.length}
             targets={targets}
             themeSlug={themeSlug}
+            isDarkOnlyTheme={isDarkOnlyTheme}
             resolvedMode={resolvedMode}
             onViewChange={handleViewChange}
             onThemeChange={onThemeChange}
@@ -479,8 +526,8 @@ export default function App() {
   const [themeSlug, setThemeSlug] = useState<ThemeSlug>(readStoredTheme);
   const [colorMode, setColorMode] = useState<"light" | "dark">(readStoredMode);
 
-  const resolvedMode: "light" | "dark" =
-    themeSlug === "gothic" ? "dark" : colorMode;
+  const isDarkOnlyTheme = themeSlug === "gothic-studio" || themeSlug === "gothic";
+  const resolvedMode: "light" | "dark" = isDarkOnlyTheme ? "dark" : colorMode;
 
   useEffect(() => {
     document.documentElement.dataset.theme = resolvedMode;
@@ -512,6 +559,7 @@ export default function App() {
       <ToastViewport position="bottomEnd" maxVisible={4}>
         <ConsoleShell
           themeSlug={themeSlug}
+          isDarkOnlyTheme={isDarkOnlyTheme}
           resolvedMode={resolvedMode}
           onThemeChange={handleThemeChange}
           onToggleColorMode={handleToggleColorMode}

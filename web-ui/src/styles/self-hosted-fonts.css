@@ -1,35 +1,35 @@
-/* Self-hosted variable Latin .woff2 fonts bundled directly by Vite for strict offline CSP. */
+/* Self-hosted variable and display Latin .woff2 fonts bundled directly by Vite for strict offline CSP. */
 
 @font-face {
-  font-family: "Fraunces";
+  font-family: "Fustat";
   font-style: normal;
   font-display: swap;
-  font-weight: 100 900;
-  src: url("@fontsource-variable/fraunces/files/fraunces-latin-wght-normal.woff2") format("woff2-variations");
+  font-weight: 200 800;
+  src: url("@fontsource-variable/fustat/files/fustat-latin-wght-normal.woff2") format("woff2-variations");
 }
 
 @font-face {
-  font-family: "Fraunces Variable";
+  font-family: "Fustat Variable";
   font-style: normal;
   font-display: swap;
-  font-weight: 100 900;
-  src: url("@fontsource-variable/fraunces/files/fraunces-latin-wght-normal.woff2") format("woff2-variations");
+  font-weight: 200 800;
+  src: url("@fontsource-variable/fustat/files/fustat-latin-wght-normal.woff2") format("woff2-variations");
 }
 
 @font-face {
-  font-family: "Albert Sans";
+  font-family: "Manufacturing Consent";
   font-style: normal;
   font-display: swap;
-  font-weight: 100 900;
-  src: url("@fontsource-variable/albert-sans/files/albert-sans-latin-wght-normal.woff2") format("woff2-variations");
+  font-weight: 400;
+  src: url("@fontsource/manufacturing-consent/files/manufacturing-consent-latin-400-normal.woff2") format("woff2");
 }
 
 @font-face {
-  font-family: "Albert Sans Variable";
+  font-family: "UnifrakturMaguntia";
   font-style: normal;
   font-display: swap;
-  font-weight: 100 900;
-  src: url("@fontsource-variable/albert-sans/files/albert-sans-latin-wght-normal.woff2") format("woff2-variations");
+  font-weight: 400;
+  src: url("@fontsource/unifrakturmaguntia/files/unifrakturmaguntia-latin-400-normal.woff2") format("woff2");
 }
 
 @font-face {

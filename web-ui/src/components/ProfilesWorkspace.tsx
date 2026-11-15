@@ -1,19 +1,25 @@
 import { useEffect, useMemo, useState, type RefObject } from "react";
-import { Badge, type BadgeVariant } from "@astryxdesign/core/Badge";
+import { Avatar, AvatarStatusDot } from "@astryxdesign/core/Avatar";
+import { Badge } from "@astryxdesign/core/Badge";
 import { Button } from "@astryxdesign/core/Button";
 import { Card } from "@astryxdesign/core/Card";
 import { CheckboxInput } from "@astryxdesign/core/CheckboxInput";
 import { Code } from "@astryxdesign/core/Code";
+import { Dialog, DialogHeader } from "@astryxdesign/core/Dialog";
 import { Divider } from "@astryxdesign/core/Divider";
+import { type DropdownMenuOption } from "@astryxdesign/core/DropdownMenu";
 import { EmptyState } from "@astryxdesign/core/EmptyState";
 import { FormLayout } from "@astryxdesign/core/FormLayout";
 import { Grid } from "@astryxdesign/core/Grid";
 import { Heading } from "@astryxdesign/core/Heading";
+import { useClipboard } from "@astryxdesign/core/hooks";
 import { HStack } from "@astryxdesign/core/HStack";
 import { Icon } from "@astryxdesign/core/Icon";
-import { Layout, LayoutContent } from "@astryxdesign/core/Layout";
+import { IconButton } from "@astryxdesign/core/IconButton";
+import { Layout, LayoutContent, LayoutHeader } from "@astryxdesign/core/Layout";
 import { List, ListItem } from "@astryxdesign/core/List";
 import { MetadataList, MetadataListItem } from "@astryxdesign/core/MetadataList";
+import { MoreMenu } from "@astryxdesign/core/MoreMenu";
 import {
   SegmentedControl,
   SegmentedControlItem,
@@ -24,17 +30,21 @@ import {
   SideNavHeading,
   SideNavSection,
 } from "@astryxdesign/core/SideNav";
+import { StackItem } from "@astryxdesign/core/Stack";
 import { StatusDot, type StatusDotVariant } from "@astryxdesign/core/StatusDot";
 import { Switch } from "@astryxdesign/core/Switch";
 import { Text } from "@astryxdesign/core/Text";
 import { TextInput } from "@astryxdesign/core/TextInput";
+import { Timestamp } from "@astryxdesign/core/Timestamp";
 import { VStack } from "@astryxdesign/core/VStack";
 import {
   ACCENT_PRESETS,
   computeCombinedState,
+  formatAuthMode,
   formatBytes,
-  profileInitials,
-  resolveAccentKey,
+  formatLinkPolicy,
+  formatRuntimeState,
+  pluralize,
 } from "../api";
 import type {
   AuthMode,
@@ -48,7 +58,7 @@ import type {
   UpdateProfilePayload,
 } from "../types";
 
-function runtimeBadgeVariant(state: RuntimeStateType): BadgeVariant {
+function runtimeDotVariant(state: RuntimeStateType): StatusDotVariant {
   if (state === "running") {
     return "success";
   }
@@ -58,14 +68,18 @@ function runtimeBadgeVariant(state: RuntimeStateType): BadgeVariant {
   return "neutral";
 }
 
-function runtimeDotVariant(state: RuntimeStateType): StatusDotVariant {
+function renderRuntimeEndState(state: RuntimeStateType) {
   if (state === "running") {
-    return "success";
+    return <Badge variant="success" label="Running" />;
   }
   if (state === "stale-lock") {
-    return "warning";
+    return <Badge variant="warning" label="Stale lock" />;
   }
-  return "neutral";
+  return (
+    <Text type="supporting" color="secondary">
+      Stopped
+    </Text>
+  );
 }
 
 export interface ProfilesSideRailProps {
@@ -114,8 +128,8 @@ export function ProfilesSideRail({
       resizable={{ defaultWidth: 300, minWidth: 240, maxWidth: 420 }}
       header={
         <SideNavHeading
-          heading="Sandboxes"
-          subheading={`${profiles.length} isolated ${profiles.length === 1 ? "profile" : "profiles"}`}
+          heading="Profiles"
+          subheading={`${profiles.length} provisioned`}
         />
       }
       topContent={
@@ -146,43 +160,35 @@ export function ProfilesSideRail({
         </VStack>
       }
     >
-      <SideNavSection
-        title="Provisioned Profiles"
-        isHeaderHidden
-      >
+      <SideNavSection title="Provisioned Profiles" isHeaderHidden>
         {filteredProfiles.length === 0 ? (
           <VStack padding={3}>
             <Text type="supporting" color="secondary">
               {profiles.length === 0
-                ? "No sandbox profiles have been provisioned yet."
-                : "No profiles match the active filter."}
+                ? "No profiles provisioned yet."
+                : "No profiles match this filter."}
             </Text>
           </VStack>
         ) : (
           <List density="balanced" hasDividers>
             {filteredProfiles.map((profile) => {
               const combined = computeCombinedState(profile.runtime);
-              const accentKey = resolveAccentKey(profile.manifest.accent);
               return (
                 <ListItem
                   key={profile.manifest.name}
                   isSelected={selectedName === profile.manifest.name}
                   onClick={() => onSelectProfile(profile.manifest.name)}
                   startContent={
-                    <span
-                      className="agyp-profile-dot"
-                      data-accent={accentKey}
-                      aria-hidden="true"
+                    <Avatar
+                      name={profile.manifest.label}
+                      size="sm"
+                      shape="rounded"
+                      tooltip={false}
                     />
                   }
                   label={profile.manifest.label}
                   description={`${profile.manifest.name} · ${profile.manifest.default_target.toUpperCase()} · ${formatBytes(profile.disk_bytes)}`}
-                  endContent={
-                    <Badge
-                      variant={runtimeBadgeVariant(combined)}
-                      label={combined === "stale-lock" ? "stale" : combined}
-                    />
-                  }
+                  endContent={renderRuntimeEndState(combined)}
                 />
               );
             })}
@@ -239,6 +245,28 @@ export function ProfilesDetailPane({
   const [editAuthMode, setEditAuthMode] = useState<AuthMode>("isolated-file");
   const [editKeepBg, setEditKeepBg] = useState(false);
   const [forceStopDelete, setForceStopDelete] = useState(false);
+  const { copy, isCopied } = useClipboard({
+    announce: "Copied profile root path",
+  });
+  const normalizedAccent = editAccent.trim().toUpperCase();
+  const accentOptions = useMemo(() => {
+    const options = ACCENT_PRESETS.map((preset) => ({
+      value: preset.hex.toUpperCase(),
+      label: preset.label,
+      description: preset.hex.toUpperCase(),
+    }));
+    if (
+      normalizedAccent &&
+      !options.some((option) => option.value === normalizedAccent)
+    ) {
+      options.push({
+        value: normalizedAccent,
+        label: `Custom (${normalizedAccent})`,
+        description: normalizedAccent,
+      });
+    }
+    return options;
+  }, [normalizedAccent]);
 
   useEffect(() => {
     if (!detail) {
@@ -262,12 +290,12 @@ export function ProfilesDetailPane({
           <LayoutContent>
             <EmptyState
               headingLevel={1}
-              title="No sandbox profiles provisioned"
-              description="Create an isolated Antigravity profile with dedicated OAuth credentials, scoped environment locks, and explicit symlink boundaries."
+              title="No profiles provisioned"
+              description="Create a sandbox profile with separate OAuth tokens and locked HOME paths."
               actions={
                 <Button
                   variant="primary"
-                  label="Create First Profile"
+                  label="New Profile"
                   onClick={onOpenCreate}
                 />
               }
@@ -287,12 +315,8 @@ export function ProfilesDetailPane({
           <LayoutContent>
             <EmptyState
               headingLevel={2}
-              title={
-                detailLoading
-                  ? "Loading sandbox inspection..."
-                  : "Select a sandbox profile"
-              }
-              description="Pick a profile from the side rail to inspect filesystem permissions, lock health, and launch targets."
+              title={detailLoading ? "Loading profile..." : "Select a profile"}
+              description="Choose a profile from the list to inspect permissions, locks, and paths."
             />
           </LayoutContent>
         }
@@ -301,11 +325,65 @@ export function ProfilesDetailPane({
   }
 
   const combinedState = computeCombinedState(detail.runtime);
-  const accentKey = resolveAccentKey(detail.manifest.accent);
   const hasDefaultLauncher = detail.launchers[detail.manifest.default_target];
   const anyRunning = combinedState === "running";
   const hubInstalled = targets?.hub.installed ?? true;
   const ideInstalled = targets?.ide.installed ?? true;
+
+  const defaultTarget = detail.manifest.default_target;
+  const altTarget: TargetKind = defaultTarget === "hub" ? "ide" : "hub";
+  const defaultInstalled = defaultTarget === "hub" ? hubInstalled : ideInstalled;
+  const altInstalled = altTarget === "hub" ? hubInstalled : ideInstalled;
+  const primaryLaunchLabel = defaultTarget === "hub" ? "Launch Hub" : "Launch IDE";
+  const altLaunchLabel = altTarget === "hub" ? "Launch Hub" : "Launch IDE";
+
+  const overflowItems: DropdownMenuOption[] = [
+    ...(anyRunning
+      ? [
+          {
+            id: "launch-alt",
+            label: altLaunchLabel,
+            isDisabled: !altInstalled || actionBusy !== null,
+            onClick: () => void onLaunch(detail.manifest.name, altTarget),
+          },
+        ]
+      : []),
+    {
+      id: "repair",
+      label: "Repair Locks",
+      icon: <Icon icon="wrench" size="sm" />,
+      isDisabled: actionBusy !== null,
+      onClick: () => void onRepair(detail.manifest.name),
+    },
+    {
+      id: "clone",
+      label: "Clone Profile",
+      icon: <Icon icon="copy" size="sm" />,
+      isDisabled: anyRunning || actionBusy !== null,
+      onClick: onOpenClone,
+    },
+    {
+      id: "launcher",
+      label: hasDefaultLauncher
+        ? "Remove .app Launcher"
+        : "Build .app Launcher",
+      isDisabled: actionBusy !== null,
+      onClick: () =>
+        void onToggleLauncher(
+          detail.manifest.name,
+          detail.manifest.default_target,
+          hasDefaultLauncher
+        ),
+    },
+    { type: "divider" },
+    {
+      id: "delete",
+      label: "Delete Profile",
+      variant: "destructive" as const,
+      isDisabled: actionBusy !== null,
+      onClick: () => onConfirmDeleteOpenChange(true),
+    },
+  ];
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -320,450 +398,459 @@ export function ProfilesDetailPane({
   };
 
   return (
-    <Layout
-      padding={6}
-      height="fill"
-      content={
-        <LayoutContent>
-          <VStack gap={5}>
-            <Card padding={5}>
-              <VStack gap={4}>
-                <HStack hAlign="between" vAlign="center" gap={4} wrap="wrap">
-                  <HStack gap={3} vAlign="center" wrap="wrap">
-                    <div
-                      className="agyp-profile-monogram"
-                      data-accent={accentKey}
-                      aria-hidden="true"
-                    >
-                      {profileInitials(detail.manifest.label, detail.manifest.name)}
-                    </div>
-                    <VStack gap={1}>
-                      <HStack gap={2} vAlign="center" wrap="wrap">
-                        <Heading level={1}>{detail.manifest.label}</Heading>
-                        <Code>{detail.manifest.name}</Code>
-                        <Badge
-                          variant={runtimeBadgeVariant(combinedState)}
-                          label={combinedState}
-                        />
-                        <Badge
-                          variant="neutral"
-                          label={detail.manifest.auth_mode}
-                        />
-                        <Badge
-                          variant="info"
-                          label={`links:${detail.manifest.link_policy}`}
-                        />
-                      </HStack>
-                      <Text type="supporting" color="secondary">
-                        Created {detail.manifest.created_at}
-                        {detail.manifest.last_launched_at
-                          ? ` · Last launched ${detail.manifest.last_launched_at}`
-                          : " · Never launched"}
-                      </Text>
-                    </VStack>
-                  </HStack>
-
-                  <HStack gap={2} vAlign="center" wrap="wrap">
-                    <Button
-                      size="sm"
+    <>
+      <Layout
+        padding={6}
+        height="fill"
+        header={
+          <LayoutHeader hasDivider>
+            <HStack hAlign="between" vAlign="center" gap={4} wrap="wrap">
+              <HStack gap={3} vAlign="center" wrap="wrap">
+                <Avatar
+                  name={detail.manifest.label}
+                  size="lg"
+                  shape="rounded"
+                  tooltip={false}
+                  status={
+                    <AvatarStatusDot
                       variant={
-                        detail.manifest.default_target === "hub"
-                          ? "primary"
-                          : "secondary"
-                      }
-                      label="Launch Hub"
-                      isDisabled={!hubInstalled || actionBusy !== null}
-                      isLoading={actionBusy === "launch-hub"}
-                      onClick={() => onLaunch(detail.manifest.name, "hub")}
-                    />
-                    <Button
-                      size="sm"
-                      variant={
-                        detail.manifest.default_target === "ide"
-                          ? "primary"
-                          : "secondary"
-                      }
-                      label="Launch IDE"
-                      isDisabled={!ideInstalled || actionBusy !== null}
-                      isLoading={actionBusy === "launch-ide"}
-                      onClick={() => onLaunch(detail.manifest.name, "ide")}
-                    />
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      icon={<Icon icon="stop" size="sm" />}
-                      label="Stop"
-                      isDisabled={!anyRunning || actionBusy !== null}
-                      isLoading={actionBusy === "stop"}
-                      onClick={() => onStop(detail.manifest.name)}
-                    />
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      icon={<Icon icon="wrench" size="sm" />}
-                      label="Repair"
-                      isDisabled={actionBusy !== null}
-                      isLoading={actionBusy === "repair"}
-                      onClick={() => onRepair(detail.manifest.name)}
-                    />
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      label="Clone"
-                      isDisabled={anyRunning || actionBusy !== null}
-                      onClick={onOpenClone}
-                    />
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      label={
-                        hasDefaultLauncher ? "Remove Launcher" : "Build Launcher"
-                      }
-                      isDisabled={actionBusy !== null}
-                      isLoading={actionBusy === "launcher"}
-                      onClick={() =>
-                        onToggleLauncher(
-                          detail.manifest.name,
-                          detail.manifest.default_target,
-                          hasDefaultLauncher
-                        )
-                      }
-                    />
-                    {!confirmDeleteOpen ? (
-                      <Button
-                        size="sm"
-                        variant="destructive"
-                        label="Delete"
-                        isDisabled={actionBusy !== null}
-                        onClick={() => onConfirmDeleteOpenChange(true)}
-                      />
-                    ) : null}
-                  </HStack>
-                </HStack>
-
-                {confirmDeleteOpen ? (
-                  <Card variant="muted" padding={3}>
-                    <HStack hAlign="between" vAlign="center" gap={3} wrap="wrap">
-                      <VStack gap={1}>
-                        <Text weight="semibold">
-                          Delete sandbox profile &ldquo;{detail.manifest.name}&rdquo;?
-                        </Text>
-                        <Text type="supporting" color="secondary">
-                          This permanently removes profile manifests, sandbox home config, and stored session tokens.
-                        </Text>
-                      </VStack>
-                      <HStack gap={3} vAlign="center" wrap="wrap">
-                        <CheckboxInput
-                          label="Force stop running processes"
-                          value={forceStopDelete}
-                          onChange={(checked) => setForceStopDelete(checked)}
-                        />
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          label="Cancel"
-                          isDisabled={actionBusy !== null}
-                          onClick={() => onConfirmDeleteOpenChange(false)}
-                        />
-                        <Button
-                          size="sm"
-                          variant="destructive"
-                          label="Confirm Delete"
-                          isLoading={actionBusy === "delete"}
-                          onClick={() =>
-                            onDeleteProfile(detail.manifest.name, forceStopDelete)
-                          }
-                        />
-                      </HStack>
-                    </HStack>
-                  </Card>
-                ) : null}
-              </VStack>
-            </Card>
-
-            <Grid columns={{ minWidth: 190, max: 4 }} gap={3}>
-              <Card padding={4}>
-                <VStack gap={1}>
-                  <Text type="label" color="secondary">
-                    Hub Runtime
-                  </Text>
-                  <HStack gap={2} vAlign="center">
-                    <StatusDot
-                      variant={runtimeDotVariant(detail.runtime.hub.state)}
-                      label={detail.runtime.hub.state}
-                    />
-                    <Heading level={3}>{detail.runtime.hub.state}</Heading>
-                  </HStack>
-                  <Text type="supporting" color="secondary" hasTabularNumbers>
-                    {detail.runtime.hub.pids.length > 0
-                      ? `PIDs: ${detail.runtime.hub.pids.join(", ")}`
-                      : `No active PIDs · ${detail.runtime.hub.lock_files.length} lock(s)`}
-                  </Text>
-                </VStack>
-              </Card>
-
-              <Card padding={4}>
-                <VStack gap={1}>
-                  <Text type="label" color="secondary">
-                    IDE Runtime
-                  </Text>
-                  <HStack gap={2} vAlign="center">
-                    <StatusDot
-                      variant={runtimeDotVariant(detail.runtime.ide.state)}
-                      label={detail.runtime.ide.state}
-                    />
-                    <Heading level={3}>{detail.runtime.ide.state}</Heading>
-                  </HStack>
-                  <Text type="supporting" color="secondary" hasTabularNumbers>
-                    {detail.runtime.ide.pids.length > 0
-                      ? `PIDs: ${detail.runtime.ide.pids.join(", ")}`
-                      : `No active PIDs · ${detail.runtime.ide.lock_files.length} lock(s)`}
-                  </Text>
-                </VStack>
-              </Card>
-
-              <Card padding={4}>
-                <VStack gap={1}>
-                  <Text type="label" color="secondary">
-                    Sandbox Footprint
-                  </Text>
-                  <Heading level={3}>
-                    {formatBytes(detail.disk_bytes)}
-                  </Heading>
-                  <Text type="supporting" color="secondary">
-                    Updated {detail.manifest.updated_at}
-                  </Text>
-                </VStack>
-              </Card>
-
-              <Card padding={4}>
-                <VStack gap={1}>
-                  <Text type="label" color="secondary">
-                    Boundary Posture
-                  </Text>
-                  <HStack gap={2} vAlign="center">
-                    <StatusDot
-                      variant={
-                        detail.isolation.zshenv_home_locked &&
-                        detail.isolation.forbidden_symlinks_present.length === 0
+                        combinedState === "running"
                           ? "success"
-                          : "error"
+                          : combinedState === "stale-lock"
+                            ? "error"
+                            : "neutral"
                       }
-                      label={
-                        detail.isolation.zshenv_home_locked
-                          ? "HOME Locked"
-                          : "Unlocked"
-                      }
+                      label={formatRuntimeState(combinedState)}
                     />
-                    <Heading level={3}>
-                      {detail.isolation.zshenv_home_locked
-                        ? "HOME Locked"
-                        : "Unlocked"}
-                    </Heading>
-                  </HStack>
-                  <Text type="supporting" color="secondary" hasTabularNumbers>
-                    {detail.isolation.forbidden_symlinks_present.length} forbidden ·{" "}
-                    {detail.isolation.active_symlinks.length} managed link(s)
-                  </Text>
-                </VStack>
-              </Card>
-            </Grid>
-
-            <Grid columns={{ minWidth: 340, max: 2 }} gap={4}>
-              <Card padding={5}>
-                <VStack gap={4}>
-                  <Heading level={2}>Isolation &amp; Policy</Heading>
-                  <form onSubmit={handleSave}>
-                    <FormLayout direction="vertical">
-                      <TextInput
-                        label="Display Label"
-                        value={editLabel}
-                        onChange={setEditLabel}
-                        isRequired
-                      />
-                      <VStack gap={1.5}>
-                        <HStack hAlign="between" vAlign="center">
-                          <Text type="label">Profile Accent</Text>
-                          <Code>{editAccent}</Code>
-                        </HStack>
-                        <div
-                          className="agyp-swatch-row"
-                          role="radiogroup"
-                          aria-label="Profile accent color"
-                        >
-                          {ACCENT_PRESETS.map((preset) => {
-                            const selected =
-                              editAccent.toUpperCase() === preset.hex.toUpperCase();
-                            return (
-                              <button
-                                key={preset.key}
-                                type="button"
-                                role="radio"
-                                aria-checked={selected}
-                                aria-label={preset.label}
-                                title={`${preset.label} (${preset.hex})`}
-                                className="agyp-swatch-button"
-                                data-accent={preset.key}
-                                onClick={() => setEditAccent(preset.hex)}
-                              />
-                            );
-                          })}
-                        </div>
-                      </VStack>
-                      <Selector
-                        label="Default Target"
-                        value={editTarget}
-                        onChange={(val) => setEditTarget(val as TargetKind)}
-                        options={[
-                          { value: "hub", label: "Antigravity Hub" },
-                          { value: "ide", label: "Antigravity IDE" },
-                        ]}
-                      />
-                      <Selector
-                        label="Symlink Inheritance Policy"
-                        value={editLinkPolicy}
-                        onChange={(val) => setEditLinkPolicy(val as LinkPolicy)}
-                        options={[
-                          {
-                            value: "none",
-                            label: "none (Strict zero host links)",
-                          },
-                          {
-                            value: "minimal",
-                            label: "minimal (Non-secret fonts and caches)",
-                          },
-                          {
-                            value: "dev",
-                            label: "dev (Include developer toolchain caches)",
-                          },
-                        ]}
-                      />
-                      <Selector
-                        label="Auth Storage Mode"
-                        value={editAuthMode}
-                        onChange={(val) => setEditAuthMode(val as AuthMode)}
-                        options={[
-                          {
-                            value: "isolated-file",
-                            label: "isolated-file (Per-sandbox token isolation)",
-                          },
-                          {
-                            value: "system-keychain",
-                            label: "system-keychain (Shared macOS login keychain)",
-                          },
-                        ]}
-                      />
-                      <Switch
-                        label="Keep background helper processes alive on close"
-                        value={editKeepBg}
-                        onChange={(checked) => setEditKeepBg(checked)}
-                      />
-                      <HStack hAlign="end">
-                        <Button
-                          type="submit"
-                          variant="primary"
-                          label="Save Policy Changes"
-                          isLoading={actionBusy === "save"}
-                          isDisabled={actionBusy !== null}
-                        />
-                      </HStack>
-                    </FormLayout>
-                  </form>
-
-                  <Divider />
-
-                  <VStack gap={2}>
-                    <Heading level={3}>On-Disk Permissions Audit</Heading>
-                    <MetadataList
-                      columns={1}
-                      label={{ position: "start", width: 155 }}
-                    >
-                      <MetadataListItem label="profile_dir">
-                        <Code>{detail.isolation.permissions.profile_dir ?? "missing"}</Code>
-                      </MetadataListItem>
-                      <MetadataListItem label="data_dir">
-                        <Code>{detail.isolation.permissions.data_dir ?? "missing"}</Code>
-                      </MetadataListItem>
-                      <MetadataListItem label="sandbox_home">
-                        <Code>{detail.isolation.permissions.sandbox_home ?? "missing"}</Code>
-                      </MetadataListItem>
-                      <MetadataListItem label=".zshenv">
-                        <Code>{detail.isolation.permissions.zshenv_file ?? "missing"}</Code>
-                      </MetadataListItem>
-                      <MetadataListItem label="oauth_token_file">
-                        <Code>
-                          {detail.isolation.permissions.oauth_token_file ?? "absent"}
-                        </Code>
-                      </MetadataListItem>
-                      <MetadataListItem label="mcp_config_file">
-                        <Code>
-                          {detail.isolation.permissions.mcp_config_file ?? "absent"}
-                        </Code>
-                      </MetadataListItem>
-                      <MetadataListItem label="Active Symlinks">
-                        <Text hasTabularNumbers>
-                          {detail.isolation.active_symlinks.length}
+                  }
+                />
+                <VStack gap={1}>
+                  <HStack gap={2} vAlign="center" wrap="wrap">
+                    <Heading level={1}>{detail.manifest.label}</Heading>
+                    {combinedState === "running" ? (
+                      <Badge variant="success" label="Running" />
+                    ) : combinedState === "stale-lock" ? (
+                      <Badge variant="warning" label="Stale lock" />
+                    ) : (
+                      <HStack gap={1} vAlign="center">
+                        <StatusDot variant="neutral" label="Stopped" />
+                        <Text type="supporting" color="secondary">
+                          Stopped
                         </Text>
-                      </MetadataListItem>
-                    </MetadataList>
-                  </VStack>
+                      </HStack>
+                    )}
+                  </HStack>
+                  <HStack gap={1.5} vAlign="center" wrap="wrap">
+                    <Code color="secondary">{detail.manifest.name}</Code>
+                    <Text type="supporting" color="secondary">
+                      · {formatAuthMode(detail.manifest.auth_mode)} ·{" "}
+                      {formatLinkPolicy(detail.manifest.link_policy)} · Created{" "}
+                      <Timestamp
+                        value={detail.manifest.created_at}
+                        format="date"
+                        timezoneID="UTC"
+                      />{" "}
+                      ·{" "}
+                      {detail.manifest.last_launched_at ? (
+                        <>
+                          Last run{" "}
+                          <Timestamp
+                            value={detail.manifest.last_launched_at}
+                            format="auto"
+                          />
+                        </>
+                      ) : (
+                        "Never launched"
+                      )}
+                    </Text>
+                  </HStack>
                 </VStack>
-              </Card>
+              </HStack>
 
-              <Card padding={5}>
-                <VStack gap={4}>
-                  <Heading level={2}>Evidence &amp; Security Ledger</Heading>
-                  <Text>{detail.evidence.summary}</Text>
-                  <MetadataList
-                    columns={1}
-                    label={{ position: "start", width: 140 }}
-                  >
-                    <MetadataListItem label="Evidence ID">
-                      <Code>{detail.evidence.evidence_id}</Code>
-                    </MetadataListItem>
-                    <MetadataListItem label="Authority">
-                      <Badge
-                        variant="info"
-                        label={`${detail.evidence.authority} (${detail.evidence.confidence})`}
+              <HStack gap={2} vAlign="center">
+                <Button
+                  size="sm"
+                  variant="primary"
+                  label={primaryLaunchLabel}
+                  isDisabled={!defaultInstalled || actionBusy !== null}
+                  isLoading={actionBusy === `launch-${defaultTarget}`}
+                  onClick={() =>
+                    void onLaunch(detail.manifest.name, defaultTarget)
+                  }
+                />
+                {anyRunning ? (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    icon={<Icon icon="stop" size="sm" />}
+                    label="Stop"
+                    isDisabled={actionBusy !== null}
+                    isLoading={actionBusy === "stop"}
+                    onClick={() => void onStop(detail.manifest.name)}
+                  />
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    label={altLaunchLabel}
+                    isDisabled={!altInstalled || actionBusy !== null}
+                    isLoading={actionBusy === `launch-${altTarget}`}
+                    onClick={() =>
+                      void onLaunch(detail.manifest.name, altTarget)
+                    }
+                  />
+                )}
+                <MoreMenu
+                  label="More profile actions"
+                  size="sm"
+                  variant="secondary"
+                  alignment="end"
+                  isDisabled={actionBusy !== null}
+                  items={overflowItems}
+                />
+              </HStack>
+            </HStack>
+          </LayoutHeader>
+        }
+        content={
+          <LayoutContent>
+            <VStack gap={4}>
+
+              <Card padding={4}>
+                <Grid columns={{ minWidth: 170, max: 4 }} gap={4}>
+                  <VStack gap={1}>
+                    <Text type="label" color="secondary">
+                      Hub Target
+                    </Text>
+                    <HStack gap={1.5} vAlign="center">
+                      <StatusDot
+                        variant={runtimeDotVariant(detail.runtime.hub.state)}
+                        label={formatRuntimeState(detail.runtime.hub.state)}
                       />
-                    </MetadataListItem>
-                    <MetadataListItem label="Observed">
-                      <Text hasTabularNumbers>{detail.evidence.observed_at}</Text>
-                    </MetadataListItem>
-                    <MetadataListItem label="Profile Root">
-                      <Code>{detail.paths.profile_dir}</Code>
-                    </MetadataListItem>
-                    <MetadataListItem label="Hub Data Dir">
-                      <Code>{detail.paths.data_dir}</Code>
-                    </MetadataListItem>
-                    <MetadataListItem label="IDE Data Dir">
-                      <Code>{detail.paths.ide_data_dir}</Code>
-                    </MetadataListItem>
-                    <MetadataListItem label="Sandbox HOME">
-                      <Code>{detail.paths.sandbox_home}</Code>
-                    </MetadataListItem>
-                  </MetadataList>
-
-                  <Divider />
-
-                  <VStack gap={2}>
-                    <Heading level={3}>Explicit Inspection Boundaries</Heading>
-                    <List density="compact" hasDividers>
-                      {detail.evidence.limitations.map((limitation, idx) => (
-                        <ListItem
-                          key={idx}
-                          startContent={<Icon icon="info" size="sm" color="secondary" />}
-                          label={limitation}
-                        />
-                      ))}
-                    </List>
+                      <Text weight="semibold">
+                        {formatRuntimeState(detail.runtime.hub.state)}
+                      </Text>
+                    </HStack>
+                    <Text type="supporting" color="secondary" hasTabularNumbers>
+                      {detail.runtime.hub.pids.length > 0
+                        ? `PID ${detail.runtime.hub.pids.join(", ")}`
+                        : pluralize(detail.runtime.hub.lock_files.length, "lock")}
+                    </Text>
                   </VStack>
-                </VStack>
+
+                  <VStack gap={1}>
+                    <Text type="label" color="secondary">
+                      IDE Target
+                    </Text>
+                    <HStack gap={1.5} vAlign="center">
+                      <StatusDot
+                        variant={runtimeDotVariant(detail.runtime.ide.state)}
+                        label={formatRuntimeState(detail.runtime.ide.state)}
+                      />
+                      <Text weight="semibold">
+                        {formatRuntimeState(detail.runtime.ide.state)}
+                      </Text>
+                    </HStack>
+                    <Text type="supporting" color="secondary" hasTabularNumbers>
+                      {detail.runtime.ide.pids.length > 0
+                        ? `PID ${detail.runtime.ide.pids.join(", ")}`
+                        : pluralize(detail.runtime.ide.lock_files.length, "lock")}
+                    </Text>
+                  </VStack>
+
+                  <VStack gap={1}>
+                    <Text type="label" color="secondary">
+                      Disk Usage
+                    </Text>
+                    <Text weight="semibold" hasTabularNumbers>
+                      {formatBytes(detail.disk_bytes)}
+                    </Text>
+                    <Text type="supporting" color="secondary">
+                      Updated{" "}
+                      <Timestamp
+                        value={detail.manifest.updated_at}
+                        format="auto"
+                      />
+                    </Text>
+                  </VStack>
+
+                  <VStack gap={1}>
+                    <Text type="label" color="secondary">
+                      HOME Isolation
+                    </Text>
+                    <HStack gap={1.5} vAlign="center">
+                      <StatusDot
+                        variant={
+                          detail.isolation.zshenv_home_locked &&
+                          detail.isolation.forbidden_symlinks_present.length ===
+                            0
+                            ? "success"
+                            : "error"
+                        }
+                        label={
+                          detail.isolation.zshenv_home_locked
+                            ? "Locked (.zshenv)"
+                            : "Unlocked"
+                        }
+                      />
+                      <Text weight="semibold">
+                        {detail.isolation.zshenv_home_locked
+                          ? "Locked (.zshenv)"
+                          : "Unlocked"}
+                      </Text>
+                    </HStack>
+                    <Text type="supporting" color="secondary" hasTabularNumbers>
+                      {detail.isolation.forbidden_symlinks_present.length}{" "}
+                      forbidden ·{" "}
+                      {pluralize(detail.isolation.active_symlinks.length, "link")}
+                    </Text>
+                  </VStack>
+                </Grid>
               </Card>
-            </Grid>
-          </VStack>
-        </LayoutContent>
-      }
-    />
+
+              <Grid columns={{ minWidth: 340, max: 2 }} gap={4}>
+                <Card padding={5}>
+                  <VStack gap={4}>
+                    <Heading level={2}>Sandbox Policy</Heading>
+                    <form onSubmit={handleSave}>
+                      <FormLayout direction="vertical">
+                        <TextInput
+                          label="Display Label"
+                          value={editLabel}
+                          onChange={setEditLabel}
+                          isRequired
+                        />
+                        <Selector
+                          label="Accent Color"
+                          value={normalizedAccent}
+                          onChange={setEditAccent}
+                          options={accentOptions}
+                        />
+                        <Selector
+                          label="Default Target"
+                          value={editTarget}
+                          onChange={(val) => setEditTarget(val as TargetKind)}
+                          options={[
+                            { value: "hub", label: "Antigravity Hub" },
+                            { value: "ide", label: "Antigravity IDE" },
+                          ]}
+                        />
+                        <Selector
+                          label="Symlink Policy"
+                          value={editLinkPolicy}
+                          onChange={(val) =>
+                            setEditLinkPolicy(val as LinkPolicy)
+                          }
+                          options={[
+                            {
+                              value: "none",
+                              label: "None (zero host links)",
+                            },
+                            {
+                              value: "minimal",
+                              label: "Minimal (fonts and safe caches)",
+                            },
+                            {
+                              value: "dev",
+                              label: "Dev (toolchain caches)",
+                            },
+                          ]}
+                        />
+                        <Selector
+                          label="Auth Storage"
+                          value={editAuthMode}
+                          onChange={(val) => setEditAuthMode(val as AuthMode)}
+                          options={[
+                            {
+                              value: "isolated-file",
+                              label: "Isolated file (per-sandbox token)",
+                            },
+                            {
+                              value: "system-keychain",
+                              label: "System keychain (macOS login)",
+                            },
+                          ]}
+                        />
+                        <Switch
+                          label="Keep helper processes running after close"
+                          value={editKeepBg}
+                          onChange={(checked) => setEditKeepBg(checked)}
+                        />
+                        <HStack hAlign="end">
+                          <Button
+                            type="submit"
+                            variant="primary"
+                            label="Save Policy"
+                            isLoading={actionBusy === "save"}
+                            isDisabled={actionBusy !== null}
+                          />
+                        </HStack>
+                      </FormLayout>
+                    </form>
+                  </VStack>
+                </Card>
+
+                <Card padding={5}>
+                  <VStack gap={4}>
+                    <Heading level={2}>Filesystem Proof</Heading>
+
+                    <VStack gap={2}>
+                      <Heading level={3}>File Permissions</Heading>
+                      <MetadataList
+                        columns={1}
+                        label={{ position: "start", width: 155 }}
+                      >
+                        <MetadataListItem label="Profile root">
+                          <Code>
+                            {detail.isolation.permissions.profile_dir ?? "--"}
+                          </Code>
+                        </MetadataListItem>
+                        <MetadataListItem label="App data">
+                          <Code>
+                            {detail.isolation.permissions.data_dir ?? "--"}
+                          </Code>
+                        </MetadataListItem>
+                        <MetadataListItem label="Sandbox HOME">
+                          <Code>
+                            {detail.isolation.permissions.sandbox_home ?? "--"}
+                          </Code>
+                        </MetadataListItem>
+                        <MetadataListItem label="Shell lock (.zshenv)">
+                          <Code>
+                            {detail.isolation.permissions.zshenv_file ?? "--"}
+                          </Code>
+                        </MetadataListItem>
+                        <MetadataListItem label="OAuth token">
+                          <Code>
+                            {detail.isolation.permissions.oauth_token_file ??
+                              "--"}
+                          </Code>
+                        </MetadataListItem>
+                        <MetadataListItem label="MCP config">
+                          <Code>
+                            {detail.isolation.permissions.mcp_config_file ??
+                              "--"}
+                          </Code>
+                        </MetadataListItem>
+                      </MetadataList>
+                    </VStack>
+
+                    <Divider />
+
+                    <VStack gap={2}>
+                      <Heading level={3}>Sandbox Paths</Heading>
+                      <MetadataList
+                        columns={1}
+                        label={{ position: "start", width: 135 }}
+                      >
+                        <MetadataListItem label="Root directory">
+                          <HStack gap={1} vAlign="center">
+                            <StackItem size="fill">
+                              <Text maxLines={1}>
+                                <Code>{detail.paths.profile_dir}</Code>
+                              </Text>
+                            </StackItem>
+                            <IconButton
+                              size="sm"
+                              variant="ghost"
+                              label={
+                                isCopied ? "Copied" : "Copy profile root path"
+                              }
+                              tooltip="Copy root path"
+                              icon={
+                                <Icon
+                                  icon={isCopied ? "check" : "copy"}
+                                  size="sm"
+                                />
+                              }
+                              onClick={() => void copy(detail.paths.profile_dir)}
+                            />
+                          </HStack>
+                        </MetadataListItem>
+                        <MetadataListItem label="Subdirectories">
+                          <Code>./data · ./ide-data · ./home</Code>
+                        </MetadataListItem>
+                        <MetadataListItem label="Evidence">
+                          <Text
+                            type="supporting"
+                            color="secondary"
+                            hasTabularNumbers
+                          >
+                            {detail.evidence.evidence_id} ·{" "}
+                            {detail.evidence.authority} (
+                            {detail.evidence.confidence})
+                          </Text>
+                        </MetadataListItem>
+                      </MetadataList>
+                    </VStack>
+
+                    <Divider />
+
+                    <VStack gap={2}>
+                      <Heading level={3}>Inspection Scope</Heading>
+                      <List density="compact" hasDividers>
+                        {detail.evidence.limitations.map((limitation, idx) => (
+                          <ListItem
+                            key={idx}
+                            startContent={
+                              <Icon icon="info" size="sm" color="secondary" />
+                            }
+                            label={limitation}
+                          />
+                        ))}
+                      </List>
+                    </VStack>
+                  </VStack>
+                </Card>
+              </Grid>
+            </VStack>
+          </LayoutContent>
+        }
+      />
+
+      <Dialog
+        isOpen={confirmDeleteOpen}
+        onOpenChange={onConfirmDeleteOpenChange}
+        width={420}
+        purpose="form"
+      >
+        <Layout
+          header={
+            <DialogHeader
+              title={`Delete ${detail.manifest.label}?`}
+              subtitle="Removes the profile directory, sandbox home, and saved tokens permanently."
+              onOpenChange={onConfirmDeleteOpenChange}
+            />
+          }
+          content={
+            <LayoutContent>
+              <CheckboxInput
+                label="Stop running processes first"
+                value={forceStopDelete}
+                onChange={(checked) => setForceStopDelete(checked)}
+              />
+            </LayoutContent>
+          }
+          footer={
+            <HStack gap={2} hAlign="end">
+              <Button
+                variant="ghost"
+                label="Cancel"
+                isDisabled={actionBusy !== null}
+                onClick={() => onConfirmDeleteOpenChange(false)}
+              />
+              <Button
+                variant="destructive"
+                label="Delete Profile"
+                isLoading={actionBusy === "delete"}
+                onClick={() =>
+                  void onDeleteProfile(detail.manifest.name, forceStopDelete)
+                }
+              />
+            </HStack>
+          }
+        />
+      </Dialog>
+    </>
   );
 }

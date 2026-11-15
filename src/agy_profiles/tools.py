@@ -41,9 +41,14 @@ from agy_profiles.evidence import (
 from agy_profiles.isolation import (
     ALL_MANAGED_LINKS,
     audit_profile_isolation,
+    collect_host_handoff,
+    detect_host_account,
+    detect_profile_account,
     inherit_host_customizations,
+    inspect_profile_sync_state,
     provision_profile_dirs,
     sanitize_mcp_json_text,
+    sync_host_customizations,
     validate_link_relpath,
 )
 from agy_profiles.macos_launcher import (
@@ -129,6 +134,8 @@ def _build_profile_summary(
         },
         "runtime": {"hub": hub_rt, "ide": ide_rt},
         "launchers": launchers,
+        "account": detect_profile_account(profile_dir),
+        "sync_state": inspect_profile_sync_state(profile_dir),
         "disk_bytes": _dir_size_bytes_no_follow(profile_dir),
     }
 
@@ -169,9 +176,124 @@ def _handle_profile_list(ctx: RuntimeContext, _params: Dict[str, Any]) -> Dict[s
     return {
         "root": str(root),
         "default_root": str(resolve_profiles_root()),
+        "host_account": detect_host_account(real_home=ctx.real_home),
         "targets": {k: v.to_dict() for k, v in targets.items()},
         "profiles": profiles,
     }
+
+
+def _parse_handoff_limit(params: Dict[str, Any]) -> int:
+    raw = params.get("limit", 10)
+    if isinstance(raw, bool):
+        raise ToolError(
+            "invalid_argument",
+            "Handoff limit must be an integer between 1 and 30.",
+            "Pass an integer limit between 1 and 30.",
+        )
+    try:
+        val = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ToolError(
+            "invalid_argument",
+            "Handoff limit must be an integer between 1 and 30.",
+            "Pass an integer limit between 1 and 30.",
+        ) from exc
+    if val < 1 or val > 30:
+        raise ToolError(
+            "invalid_argument",
+            "Handoff limit {} is out of range (1 to 30).".format(val),
+            "Pass an integer limit between 1 and 30.",
+        )
+    return val
+
+
+def _handle_profile_sync(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
+    name = validate_profile_name(str(params.get("name") or ""))
+    include_sidecars = bool(params.get("include_sidecars", False))
+    include_handoff = bool(params.get("include_handoff", True))
+    restart = bool(params.get("restart", False))
+    limit = _parse_handoff_limit(params)
+
+    profile_dir, manifest = load_manifest(ctx.root, name)
+    stop_res: Optional[Dict[str, Any]] = None
+    launch_res: Optional[Dict[str, Any]] = None
+    if restart:
+        stop_res = stop_profile(ctx.root, profile_dir, target="all")
+
+    provision_profile_dirs(ctx.root, manifest, real_home=ctx.real_home)
+    sync_res = sync_host_customizations(
+        profile_dir,
+        real_home=ctx.real_home,
+        include_sidecars=include_sidecars,
+        include_handoff=include_handoff,
+        handoff_limit=limit,
+    )
+
+    if restart:
+        launch_res = launch_profile(
+            ctx.root,
+            profile_dir,
+            manifest,
+            target=manifest.default_target,
+            real_home=ctx.real_home,
+        )
+
+    ps_rows = list_all_processes()
+    summary = _build_profile_summary(ctx.root, profile_dir, manifest, ps_rows)
+    ev = EvidenceRecord(
+        operation="profile_sync",
+        authority="filesystem",
+        confidence="observed",
+        summary="Synced {} projects, {} plugins, {} agents into '{}' (redacted {}, stripped {} sidecars).".format(
+            sync_res["projects_synced"],
+            sync_res["plugins_synced"],
+            sync_res["agents_synced"],
+            manifest.name,
+            sync_res["redacted_secrets"],
+            sync_res["stripped_sidecars"],
+        ),
+        facts={
+            "profile": manifest.name,
+            "restarted": restart,
+            "projects_synced": sync_res["projects_synced"],
+            "plugins_synced": sync_res["plugins_synced"],
+            "agents_synced": sync_res["agents_synced"],
+            "skills_synced": sync_res["skills_synced"],
+            "redacted_secrets": sync_res["redacted_secrets"],
+            "stripped_sidecars": sync_res["stripped_sidecars"],
+            "handoff_written": bool(sync_res["handoff"].get("written")),
+        },
+        limitations=[],
+    )
+    summary["sync"] = sync_res
+    summary["restarted"] = restart
+    summary["stop"] = stop_res
+    summary["launch"] = launch_res
+    summary["evidence"] = ev.to_dict()
+    return summary
+
+
+def _handle_host_handoff(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
+    limit = _parse_handoff_limit(params)
+    digest = collect_host_handoff(real_home=ctx.real_home, limit=limit)
+    host_account = detect_host_account(real_home=ctx.real_home)
+    ev = EvidenceRecord(
+        operation="host_handoff",
+        authority="filesystem",
+        confidence="observed" if digest.get("available") else "inferred",
+        summary="Read {} Host conversations read-only for cross-account handoff.".format(
+            digest["count"]
+        ),
+        facts={
+            "available": digest["available"],
+            "count": digest["count"],
+            "host_account": host_account.get("email"),
+        },
+        limitations=([] if digest.get("available") else [str(digest.get("reason") or "Host database unavailable.")]),
+    )
+    digest["host_account_details"] = host_account
+    digest["evidence"] = ev.to_dict()
+    return digest
 
 
 def _handle_profile_inspect(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -187,9 +309,11 @@ def _handle_profile_inspect(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict
         summary="Inspected sandbox profile {!r} permissions, symlinks, and runtime locks.".format(manifest.name),
         facts={
             "profile": manifest.name,
+            "account_email": summary["account"]["email"],
             "permissions": iso["permissions"],
             "zshenv_home_locked": iso["zshenv_home_locked"],
             "forbidden_symlinks_present": iso["forbidden_symlinks_present"],
+            "sync_state": iso["sync_state"],
             "runtime_hub_state": summary["runtime"]["hub"]["state"],
             "runtime_ide_state": summary["runtime"]["ide"]["state"],
         },
@@ -1025,6 +1149,37 @@ TOOL_SPECS: List[ToolSpec] = [
         },
         handler=_handle_launcher_remove,
         mutates=True,
+    ),
+    ToolSpec(
+        name="profile_sync",
+        description="Sync sanitized host projects, plugins, agents, skills, rules, MCP JSON, and optional handoff context into a profile.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "include_sidecars": {"type": "boolean", "default": False},
+                "include_handoff": {"type": "boolean", "default": True},
+                "restart": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+        handler=_handle_profile_sync,
+        mutates=True,
+    ),
+    ToolSpec(
+        name="host_handoff",
+        description="Read active host Antigravity conversations read-only to generate a resume digest.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10},
+            },
+            "additionalProperties": False,
+        },
+        handler=_handle_host_handoff,
+        mutates=False,
     ),
     ToolSpec(
         name="system_doctor",

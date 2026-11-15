@@ -1,5 +1,5 @@
 import type { ThemeSlug } from "./astryx-themes";
-import type { RuntimeStateType, TargetRuntime } from "./types";
+import type { AuthMode, LinkPolicy, RuntimeStateType, TargetRuntime } from "./types";
 
 export interface AccentPreset {
   key: string;
@@ -8,12 +8,12 @@ export interface AccentPreset {
 }
 
 export const ACCENT_PRESETS: ReadonlyArray<AccentPreset> = [
-  { key: "ochre", label: "Warm Ochre", hex: "#B45309" },
-  { key: "moss", label: "Sage Moss", hex: "#3F6212" },
-  { key: "verdigris", label: "Deep Verdigris", hex: "#0F766E" },
-  { key: "carmine", label: "Oxide Carmine", hex: "#9F1239" },
-  { key: "slate", label: "Mineral Slate", hex: "#57534E" },
-  { key: "sienna", label: "Burnt Sienna", hex: "#7C2D12" },
+  { key: "ochre", label: "Ochre", hex: "#B45309" },
+  { key: "moss", label: "Moss", hex: "#3F6212" },
+  { key: "verdigris", label: "Verdigris", hex: "#0F766E" },
+  { key: "carmine", label: "Carmine", hex: "#9F1239" },
+  { key: "slate", label: "Slate", hex: "#57534E" },
+  { key: "sienna", label: "Sienna", hex: "#7C2D12" },
 ];
 
 export interface ThemeOption {
@@ -23,18 +23,22 @@ export interface ThemeOption {
 }
 
 export const THEME_OPTIONS: ThemeOption[] = [
-  { value: "stone", label: "Stone", description: "Warm mineral paper and bronze focus" },
-  { value: "chocolate", label: "Chocolate", description: "Rich cocoa surface and copper amber" },
-  { value: "gothic", label: "Gothic", description: "Candlelit obsidian dark workspace" },
-  { value: "matcha", label: "Matcha", description: "Botanical sage and warm cream" },
-  { value: "neutral", label: "Neutral", description: "Crisp neutral studio canvas" },
+  {
+    value: "gothic-studio",
+    label: "Gothic Studio",
+    description: "Refined dark slate console with Fustat typography",
+  },
+  {
+    value: "gothic",
+    label: "Gothic",
+    description: "Editorial blue-gray dark surfaces from Astryx",
+  },
+  {
+    value: "neutral",
+    label: "Neutral",
+    description: "Clean neutral workspace with light and dark modes",
+  },
 ];
-
-export function resolveAccentKey(hex: string): string {
-  const normalized = (hex || "").trim().toUpperCase();
-  const matched = ACCENT_PRESETS.find((preset) => preset.hex.toUpperCase() === normalized);
-  return matched ? matched.key : "ochre";
-}
 
 export function stripBootstrapTokenFromUrl(): void {
   const params = new URLSearchParams(window.location.search);
@@ -138,15 +142,6 @@ export function formatBytes(bytes: number): string {
   return `${value.toFixed(value >= 10 ? 1 : 2)} ${units[idx]}`;
 }
 
-export function profileInitials(label: string, slug: string): string {
-  const source = (label || slug || "AP").trim();
-  const words = source.split(/[\s._-]+/).filter(Boolean);
-  if (words.length >= 2) {
-    return `${words[0][0]}${words[1][0]}`.toUpperCase();
-  }
-  return source.slice(0, 2).toUpperCase();
-}
-
 export function computeCombinedState(rt: {
   hub: TargetRuntime;
   ide: TargetRuntime;
@@ -158,4 +153,32 @@ export function computeCombinedState(rt: {
     return "stale-lock";
   }
   return "stopped";
+}
+
+export function pluralize(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+export function formatRuntimeState(state: RuntimeStateType): string {
+  if (state === "running") {
+    return "Running";
+  }
+  if (state === "stale-lock") {
+    return "Stale lock";
+  }
+  return "Stopped";
+}
+
+export function formatAuthMode(mode: AuthMode): string {
+  return mode === "isolated-file" ? "Isolated file" : "System keychain";
+}
+
+export function formatLinkPolicy(policy: LinkPolicy): string {
+  if (policy === "none") {
+    return "No host links";
+  }
+  if (policy === "dev") {
+    return "Dev cache links";
+  }
+  return "Minimal links";
 }

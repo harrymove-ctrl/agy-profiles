@@ -62,7 +62,9 @@ class McpAndCliTests(unittest.TestCase):
         tool_names = {t["name"] for t in tools}
         self.assertIn("profile_create", tool_names)
         self.assertIn("obligations_verify", tool_names)
-        self.assertGreaterEqual(len(tool_names), 13)
+        self.assertIn("profile_sync", tool_names)
+        self.assertIn("host_handoff", tool_names)
+        self.assertGreaterEqual(len(tool_names), 15)
 
         create_payload = json.loads(responses[2]["result"]["content"][0]["text"])
         self.assertFalse(responses[2]["result"].get("isError", False))
@@ -90,6 +92,8 @@ class McpAndCliTests(unittest.TestCase):
             ["--root", str(self.root), "clone", "cli-one", "cli-two", "--json"],
             ["--root", str(self.root), "repair", "cli-one", "--json"],
             ["--root", str(self.root), "doctor", "--json"],
+            ["--root", str(self.root), "sync", "cli-one", "--no-handoff", "--json"],
+            ["--root", str(self.root), "handoff", "--limit", "5", "--json"],
             ["--root", str(self.root), "obligations", "--json"],
             ["--root", str(self.root), "delete", "cli-two", "--yes", "--json"],
         ]

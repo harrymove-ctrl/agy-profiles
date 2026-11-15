@@ -1,11 +1,15 @@
 import { Badge } from "@astryxdesign/core/Badge";
 import { Button } from "@astryxdesign/core/Button";
-import { Code } from "@astryxdesign/core/Code";
-import { Heading } from "@astryxdesign/core/Heading";
+import { useMediaQuery } from "@astryxdesign/core/hooks";
 import { HStack } from "@astryxdesign/core/HStack";
+import { Icon } from "@astryxdesign/core/Icon";
+import { NavIcon } from "@astryxdesign/core/NavIcon";
+import { Section } from "@astryxdesign/core/Section";
 import { Selector } from "@astryxdesign/core/Selector";
 import { Tab, TabList } from "@astryxdesign/core/TabList";
-import { TopNav } from "@astryxdesign/core/TopNav";
+import { Text } from "@astryxdesign/core/Text";
+import { Token } from "@astryxdesign/core/Token";
+import { TopNav, TopNavHeading } from "@astryxdesign/core/TopNav";
 import type { ThemeSlug } from "../astryx-themes";
 import { THEME_OPTIONS } from "../api";
 import type { AppView, TargetInfo } from "../types";
@@ -17,6 +21,7 @@ export interface TopBarProps {
   profileCount: number;
   targets: { hub: TargetInfo; ide: TargetInfo } | null;
   themeSlug: ThemeSlug;
+  isDarkOnlyTheme: boolean;
   resolvedMode: "light" | "dark";
   onViewChange: (view: AppView) => void;
   onThemeChange: (slug: ThemeSlug) => void;
@@ -31,12 +36,14 @@ export function TopBar({
   profileCount,
   targets,
   themeSlug,
+  isDarkOnlyTheme,
   resolvedMode,
   onViewChange,
   onThemeChange,
   onToggleColorMode,
   onOpenCreate,
 }: TopBarProps) {
+  const isWide = useMediaQuery("(min-width: 1180px)");
   const hubInstalled = targets?.hub.installed ?? false;
   const ideInstalled = targets?.ide.installed ?? false;
 
@@ -44,16 +51,18 @@ export function TopBar({
     <TopNav
       label="Primary console navigation"
       heading={
-        <HStack gap={2} vAlign="center">
-          <img src="/mark.svg" alt="" width={28} height={28} />
-          <Heading level={4}>agy-profiles</Heading>
-          <Badge variant="neutral" label={version ? `v${version}` : "local"} />
-          {root ? (
-            <span className="agyp-root-chip" title={root}>
-              <Code color="secondary">{root}</Code>
-            </span>
-          ) : null}
-        </HStack>
+        <TopNavHeading
+          logo={<NavIcon icon={<Icon icon="success" size="sm" />} />}
+          heading="agy-profiles"
+          subheading={version ? `v${version}` : "local"}
+          headerEndContent={
+            isWide && root ? (
+              <Section variant="transparent" maxWidth={210} padding={0}>
+                <Token size="sm" color="gray" label={root} />
+              </Section>
+            ) : undefined
+          }
+        />
       }
       centerContent={
         <TabList
@@ -68,24 +77,24 @@ export function TopBar({
       }
       endContent={
         <HStack gap={2} vAlign="center" wrap="wrap">
-          {targets ? (
-            <HStack gap={1.5} vAlign="center" className="agyp-target-badges">
-              <Badge
-                variant={hubInstalled ? "success" : "warning"}
-                label={hubInstalled ? `Hub ${targets.hub.version}` : "Hub Missing"}
-              />
-              <Badge
-                variant={ideInstalled ? "info" : "warning"}
-                label={ideInstalled ? `IDE ${targets.ide.version}` : "IDE Missing"}
-              />
-            </HStack>
+          {isWide && targets ? (
+            !hubInstalled && !ideInstalled ? (
+              <Badge variant="warning" label="No Targets" />
+            ) : (
+              <Text type="supporting" color="secondary" hasTabularNumbers>
+                {[
+                  hubInstalled ? `Hub ${targets.hub.version}` : "Hub missing",
+                  ideInstalled ? `IDE ${targets.ide.version}` : "IDE missing",
+                ].join(" · ")}
+              </Text>
+            )
           ) : null}
           <Selector
             label="Console theme"
             isLabelHidden
             size="sm"
             variant="secondary"
-            width={142}
+            width={156}
             value={themeSlug}
             onChange={(slug) => onThemeChange(slug as ThemeSlug)}
             options={THEME_OPTIONS.map((t) => ({
@@ -94,28 +103,20 @@ export function TopBar({
               description: t.description,
             }))}
           />
-          <Button
-            size="sm"
-            variant="secondary"
-            label={
-              themeSlug === "gothic"
-                ? "Dark"
-                : resolvedMode === "dark"
-                  ? "Dark"
-                  : "Light"
-            }
-            tooltip={
-              themeSlug === "gothic"
-                ? "Gothic theme uses dark mode"
-                : "Toggle light or dark appearance"
-            }
-            isDisabled={themeSlug === "gothic"}
-            onClick={onToggleColorMode}
-          />
+          {!isDarkOnlyTheme ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              label={resolvedMode === "dark" ? "Dark" : "Light"}
+              tooltip="Toggle light or dark appearance"
+              onClick={onToggleColorMode}
+            />
+          ) : null}
           <Button
             size="sm"
             variant="primary"
             label="New Profile"
+            tooltip="Create profile (N)"
             onClick={onOpenCreate}
           />
         </HStack>

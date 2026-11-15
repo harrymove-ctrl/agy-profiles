@@ -133,6 +133,22 @@ def _build_parser() -> argparse.ArgumentParser:
         pl.add_argument("--target", choices=("hub", "ide"))
         pl.add_argument("--dest")
 
+    p_sync = sub.add_parser(
+        "sync",
+        parents=[common_sub],
+        help="Sync sanitized host projects, plugins, agents, skills, MCP JSON, and handoff context.",
+    )
+    p_sync.add_argument("name", help="Target profile name.")
+    p_sync.add_argument("--include-sidecars", action="store_true", help="Preserve host project sidecar schedules.")
+    p_sync.add_argument("--no-handoff", action="store_true", help="Skip writing ~/.gemini/HANDOFF_CONTEXT.md.")
+    p_sync.add_argument("--restart", action="store_true", help="Stop and relaunch the profile after syncing.")
+    p_sync.add_argument("--limit", type=int, default=10, help="Maximum recent host conversations for handoff.")
+    p_handoff = sub.add_parser(
+        "handoff",
+        parents=[common_sub],
+        help="Read active host Antigravity conversations read-only as a resume digest.",
+    )
+    p_handoff.add_argument("--limit", type=int, default=10, help="Maximum host conversations to include.")
     sub.add_parser("doctor", parents=[common_sub], help="Check host Antigravity bundles, permissions, and lock health.")
     sub.add_parser(
         "obligations",
@@ -152,6 +168,15 @@ def _build_parser() -> argparse.ArgumentParser:
 def _print_human(command: str, data: Dict[str, Any]) -> None:
     if command in ("list", "ls"):
         print("Storage root: {}".format(data["root"]))
+        host_acct = data.get("host_account") or {}
+        print(
+            "Host account: {} ({} projects, {} plugins, {} agents)".format(
+                host_acct.get("email") or "unsigned",
+                host_acct.get("projects_count", 0),
+                host_acct.get("plugins_count", 0),
+                host_acct.get("agents_count", 0),
+            )
+        )
         for k, t in data["targets"].items():
             status = "v{}".format(t["version"]) if t["installed"] else "not installed"
             print("Target {}: {} ({})".format(k.upper(), t["display_name"], status))
@@ -160,14 +185,20 @@ def _print_human(command: str, data: Dict[str, Any]) -> None:
             print("No profiles found. Create one with 'agy-profiles create work'.")
             return
         print("")
-        print("{:<20} {:<20} {:<6} {:<10} {:<10}".format("NAME", "LABEL", "TARGET", "HUB", "IDE"))
+        print(
+            "{:<18} {:<18} {:<26} {:<6} {:<10} {:<10}".format(
+                "NAME", "LABEL", "ACCOUNT", "TARGET", "HUB", "IDE"
+            )
+        )
         for entry in profiles:
             m = entry["manifest"]
             rt = entry["runtime"]
+            acct_email = (entry.get("account") or {}).get("email") or "unsigned"
             print(
-                "{:<20} {:<20} {:<6} {:<10} {:<10}".format(
-                    m["name"][:20],
-                    m["label"][:20],
+                "{:<18} {:<18} {:<26} {:<6} {:<10} {:<10}".format(
+                    m["name"][:18],
+                    m["label"][:18],
+                    acct_email[:26],
                     m["default_target"].upper(),
                     rt["hub"]["state"],
                     rt["ide"]["state"],
@@ -175,15 +206,60 @@ def _print_human(command: str, data: Dict[str, Any]) -> None:
             )
         return
 
-    if command in ("inspect", "create", "update", "clone"):
+    if command in ("inspect", "create", "update", "clone", "sync"):
         m = data["manifest"]
         rt = data["runtime"]
+        acct = data.get("account") or {}
+        sync_state = data.get("sync_state") or {}
         print("Profile: {} ({})".format(m["name"], m["label"]))
+        print("Account: {} ({})".format(acct.get("email") or "unsigned", acct.get("source") or "unknown"))
         print("Target: {} | Links: {} | Auth: {}".format(m["default_target"], m["link_policy"], m["auth_mode"]))
         print("Directory: {}".format(data["paths"]["profile_dir"]))
         print("Hub: {} | IDE: {}".format(rt["hub"]["state"], rt["ide"]["state"]))
+        if sync_state:
+            print(
+                "Setup: {} projects | {} plugins | {} agents | {} skills | MCP {} | Handoff {}".format(
+                    sync_state.get("projects_count", 0),
+                    sync_state.get("plugins_count", 0),
+                    sync_state.get("agents_count", 0),
+                    sync_state.get("skills_count", 0),
+                    "yes" if sync_state.get("mcp_present") else "no",
+                    "yes" if sync_state.get("handoff_present") else "no",
+                )
+            )
+        if "sync" in data:
+            sy = data["sync"]
+            print(
+                "Synced: {} copied | {} secrets redacted | {} sidecars stripped | restarted={}".format(
+                    len(sy.get("copied") or []),
+                    sy.get("redacted_secrets", 0),
+                    sy.get("stripped_sidecars", 0),
+                    data.get("restarted", False),
+                )
+            )
         if "evidence" in data:
             print("Evidence: {} ({})".format(data["evidence"]["evidence_id"], data["evidence"]["summary"]))
+        return
+
+    if command == "handoff":
+        print("Host account: {}".format(data.get("host_account") or "unsigned"))
+        print("Available: {} | Conversations: {}".format(data.get("available"), data.get("count", 0)))
+        for idx, item in enumerate(data.get("conversations") or [], start=1):
+            print(
+                "{}. [{}] {} ({})".format(
+                    idx,
+                    item.get("project") or "General",
+                    item.get("title") or "Untitled",
+                    item.get("status") or "idle",
+                )
+            )
+            detail = item.get("last_user_request") or item.get("last_agent_summary") or ""
+            if detail:
+                print("   {}".format(detail))
+        if data.get("resume_prompt"):
+            print("")
+            print("Resume prompt:")
+            print(data["resume_prompt"])
         return
 
     if command in ("launch", "open", "run"):
@@ -328,6 +404,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                 {"name": args.name, "target": args.target, "dest": args.dest},
                 ctx,
             )
+        elif cmd == "sync":
+            result = call_tool(
+                "profile_sync",
+                {
+                    "name": args.name,
+                    "include_sidecars": bool(args.include_sidecars),
+                    "include_handoff": not bool(args.no_handoff),
+                    "restart": bool(args.restart),
+                    "limit": int(args.limit),
+                },
+                ctx,
+            )
+        elif cmd == "handoff":
+            result = call_tool("host_handoff", {"limit": int(args.limit)}, ctx)
         elif cmd == "doctor":
             result = call_tool("system_doctor", {}, ctx)
         elif cmd == "obligations":

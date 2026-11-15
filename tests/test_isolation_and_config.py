@@ -21,15 +21,24 @@ from agy_profiles.config import (
     save_manifest,
     validate_profile_name,
 )
+import base64
+import sqlite3
+
 from agy_profiles.errors import ToolError
 from agy_profiles.isolation import (
+    HANDOFF_START_MARKER,
     REDACTED_MARKER,
     audit_profile_isolation,
+    collect_host_handoff,
+    detect_host_account,
+    detect_profile_account,
     inherit_host_customizations,
     provision_profile_dirs,
     purge_stale_caches_if_upgraded,
     sanitize_mcp_json_text,
+    sync_host_customizations,
     validate_link_relpath,
+    write_handoff_context,
 )
 from agy_profiles.tools import RuntimeContext, call_tool
 
@@ -260,6 +269,197 @@ class ConfigAndIsolationTests(unittest.TestCase):
         with self.assertRaises(ToolError) as cm:
             load_manifest(self.root, "nonexistent")
         self.assertEqual(cm.exception.code, "profile_not_found")
+
+    def test_detect_profile_and_host_account_without_token_leak(self) -> None:
+        ctx = RuntimeContext(root=self.root, real_home=self.fake_home)
+        call_tool("profile_create", {"name": "acct-check", "label": "Acct Check"}, ctx)
+        profile_dir, _ = load_manifest(self.root, "acct-check")
+        secret_tok = "tok" + "_do_not_expose_12345"
+        token_path = profile_dir / "home" / ".gemini" / "jetski-standalone-oauth-token"
+        token_path.write_text(
+            json.dumps(
+                {
+                    "token": secret_tok,
+                    "id_token_email": "alice@example.com",
+                    "auth_method": "consumer",
+                }
+            ),
+            encoding="utf-8",
+        )
+        os.chmod(str(token_path), 0o600)
+
+        acct = detect_profile_account(profile_dir)
+        self.assertEqual(acct["email"], "alice@example.com")
+        self.assertEqual(acct["source"], "oauth_token")
+        self.assertEqual(acct["auth_method"], "consumer")
+        self.assertTrue(acct["oauth_present"])
+        self.assertNotIn(secret_tok, json.dumps(acct))
+        self.assertNotIn("token", acct)
+
+        jwt_payload = base64.urlsafe_b64encode(b'{"email":"jwt-user@example.com"}').decode("ascii").rstrip("=")
+        token_path.write_text(
+            json.dumps({"token": secret_tok, "id_token": "hdr.{}.sig".format(jwt_payload)}),
+            encoding="utf-8",
+        )
+        jwt_acct = detect_profile_account(profile_dir)
+        self.assertEqual(jwt_acct["email"], "jwt-user@example.com")
+
+        app_dir = self.fake_home / "Library" / "Application Support" / "Antigravity"
+        app_dir.mkdir(parents=True)
+        (app_dir / "app_storage.json").write_text(
+            json.dumps({"agy.onboarding.lastLoginUsername": "bob@example.com"}),
+            encoding="utf-8",
+        )
+        (self.fake_home / ".gemini" / "config" / "projects").mkdir(parents=True)
+        (self.fake_home / ".gemini" / "config" / "projects" / "p1.json").write_text(
+            json.dumps({"id": "p1", "name": "DemoProj"}),
+            encoding="utf-8",
+        )
+        (self.fake_home / ".gemini" / "config" / "plugins" / "plug1").mkdir(parents=True)
+        (self.fake_home / ".gemini" / "config" / "agents").mkdir(parents=True)
+        (self.fake_home / ".gemini" / "config" / "agents" / "reviewer.md").write_text("# Reviewer\n", encoding="utf-8")
+
+        host_acct = detect_host_account(real_home=self.fake_home)
+        self.assertEqual(host_acct["email"], "bob@example.com")
+        self.assertEqual(host_acct["projects_count"], 1)
+        self.assertEqual(host_acct["plugins_count"], 1)
+        self.assertEqual(host_acct["agents_count"], 1)
+
+    def test_sync_host_customizations_strips_sidecars_dedupes_mcp_and_links_agents(self) -> None:
+        (self.fake_home / ".agents" / "skills" / "demo").mkdir(parents=True)
+        (self.fake_home / ".agents" / "skills" / "demo" / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+
+        host_gemini = self.fake_home / ".gemini"
+        (host_gemini / "config" / "projects").mkdir(parents=True)
+        (host_gemini / "config" / "agents").mkdir(parents=True)
+        (host_gemini / "config" / "plugins" / "plug-a").mkdir(parents=True)
+        (host_gemini / "config" / "skills" / "skill-a").mkdir(parents=True)
+        (host_gemini / "antigravity").mkdir(parents=True)
+
+        fake_bearer = "Bearer " + "secretvalue123456789"
+        cfg_mcp = host_gemini / "config" / "mcp_config.json"
+        cfg_mcp.write_text(
+            json.dumps({"mcpServers": {"s1": {"headers": {"Authorization": fake_bearer}}}}),
+            encoding="utf-8",
+        )
+        os.symlink("../config/mcp_config.json", str(host_gemini / "antigravity" / "mcp_config.json"))
+
+        (host_gemini / "config" / "config.json").write_text(
+            json.dumps({"theme": "dark", "sidecars": {"daily-cron": {"schedule": "0 14 * * *"}}}),
+            encoding="utf-8",
+        )
+        (host_gemini / "config" / "projects" / "p1.json").write_text(
+            json.dumps({"id": "p1", "name": "DemoProj", "sidecar": {"cron": "*/5 * * * *"}}),
+            encoding="utf-8",
+        )
+        (host_gemini / "config" / "agents" / "architect.md").write_text("# Architect\n", encoding="utf-8")
+        (host_gemini / "config" / "plugins" / "plug-a" / "plugin.json").write_text('{"name":"plug-a"}\n', encoding="utf-8")
+        (host_gemini / "config" / "skills" / "skill-a" / "SKILL.md").write_text("# Skill A\n", encoding="utf-8")
+
+        ctx = RuntimeContext(root=self.root, real_home=self.fake_home)
+        created = call_tool(
+            "profile_create",
+            {"name": "dev-sync", "label": "Dev Sync", "link_policy": "dev", "inherit_config": True},
+            ctx,
+        )
+        profile_dir = Path(created["paths"]["profile_dir"])
+        self.assertTrue((profile_dir / "home" / ".agents").is_symlink())
+
+        sync_res = sync_host_customizations(profile_dir, real_home=self.fake_home, include_sidecars=False)
+        self.assertEqual(sync_res["redacted_secrets"], 1)
+        self.assertEqual(sync_res["stripped_sidecars"], 2)
+        self.assertEqual(sync_res["projects_synced"], 1)
+        self.assertEqual(sync_res["plugins_synced"], 1)
+        self.assertEqual(sync_res["agents_synced"], 1)
+        self.assertEqual(sync_res["skills_synced"], 1)
+
+        sandbox_cfg = json.loads((profile_dir / "home" / ".gemini" / "config" / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(sandbox_cfg["sidecars"], {})
+        sandbox_proj = json.loads((profile_dir / "home" / ".gemini" / "config" / "projects" / "p1.json").read_text(encoding="utf-8"))
+        self.assertNotIn("sidecar", sandbox_proj)
+
+        _, manifest = load_manifest(self.root, "dev-sync")
+        iso = audit_profile_isolation(profile_dir, manifest)
+        self.assertEqual(iso["permissions"]["mcp_config_file"], "0o600")
+        self.assertEqual(iso["sync_state"]["projects_count"], 1)
+        self.assertEqual(iso["sync_state"]["agents_count"], 1)
+
+    def test_collect_host_handoff_and_idempotent_gemini_pointer(self) -> None:
+        host_gemini = self.fake_home / ".gemini"
+        (host_gemini / "config" / "projects").mkdir(parents=True)
+        (host_gemini / "config" / "projects" / "p1.json").write_text(
+            json.dumps({"id": "p1", "name": "WorkingDaily"}),
+            encoding="utf-8",
+        )
+        (host_gemini / "GEMINI.md").write_text("# Base Rules\n", encoding="utf-8")
+
+        agy_dir = host_gemini / "antigravity"
+        (agy_dir / "annotations").mkdir(parents=True)
+        brain_logs = agy_dir / "brain" / "conv-1" / ".system_generated" / "logs"
+        brain_logs.mkdir(parents=True)
+
+        db_path = agy_dir / "conversation_summaries.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """
+            CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT,
+                preview TEXT,
+                last_modified_time TEXT,
+                workspace_uris TEXT,
+                status TEXT,
+                project_id TEXT,
+                parent_conversation_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("conv-1", "", "fallback preview", "2026-11-15 10:00:00+00:00", '["file:///tmp/DemoRepo"]', "CASCADE_RUN_STATUS_IDLE", "p1", ""),
+        )
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("conv-sub", "Subagent", "hidden", "2026-11-15 10:05:00+00:00", '[]', "CASCADE_RUN_STATUS_IDLE", "p1", "conv-1"),
+        )
+        conn.commit()
+        conn.close()
+
+        (agy_dir / "annotations" / "conv-1.pbtxt").write_text('title: "Ship profile handoff"\n', encoding="utf-8")
+        leaked_ghp = "gh" + "p_1234567890abcdef"
+        steps = [
+            {"type": "USER_INPUT", "content": "<CONTEXT_SUMMARY>internal</CONTEXT_SUMMARY>Finish phase \u2014 two using " + leaked_ghp},
+            {"type": "PLANNER_RESPONSE", "content": "Implemented backend validation cleanly."},
+        ]
+        brain_logs.joinpath("transcript.jsonl").write_text(
+            "\n".join(json.dumps(s) for s in steps) + "\n",
+            encoding="utf-8",
+        )
+
+        digest = collect_host_handoff(real_home=self.fake_home, limit=5)
+        self.assertTrue(digest["available"])
+        self.assertEqual(digest["count"], 1)
+        conv = digest["conversations"][0]
+        self.assertEqual(conv["title"], "Ship profile handoff")
+        self.assertEqual(conv["project"], "WorkingDaily")
+        self.assertNotIn("\u2014", conv["last_user_request"])
+        self.assertNotIn(leaked_ghp, conv["last_user_request"])
+        self.assertIn(REDACTED_MARKER, conv["last_user_request"])
+
+        ctx = RuntimeContext(root=self.root, real_home=self.fake_home)
+        call_tool("profile_create", {"name": "handoff-box", "label": "Handoff Box"}, ctx)
+        profile_dir, _ = load_manifest(self.root, "handoff-box")
+        sync_host_customizations(profile_dir, real_home=self.fake_home, include_handoff=True)
+        sync_host_customizations(profile_dir, real_home=self.fake_home, include_handoff=True)
+
+        handoff_md = profile_dir / "home" / ".gemini" / "HANDOFF_CONTEXT.md"
+        self.assertTrue(handoff_md.is_file())
+        self.assertEqual(oct(handoff_md.stat().st_mode & 0o777), "0o600")
+        self.assertNotIn("\u2014", handoff_md.read_text(encoding="utf-8"))
+
+        gemini_text = (profile_dir / "home" / ".gemini" / "GEMINI.md").read_text(encoding="utf-8")
+        self.assertEqual(gemini_text.count(HANDOFF_START_MARKER), 1)
+        _ = write_handoff_context
 
 
 if __name__ == "__main__":

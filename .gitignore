@@ -13,3 +13,6 @@ dist/
 node_modules/
 web-ui/node_modules/
 web-ui/.astryx/
+web-ui/themes/**/*.html
+web-ui/themes/**/*.png
+web-ui/themes/**/*.pictures.json

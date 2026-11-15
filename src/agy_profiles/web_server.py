@@ -406,6 +406,11 @@ class HardenedWebHandler(BaseHTTPRequestHandler):
             if path == "/api/doctor":
                 self._send_json(200, call_tool("system_doctor", {}, self.state.ctx))
                 return
+            if path == "/api/handoff":
+                qs = parse_qs(parsed.query)
+                raw_limit = (qs.get("limit") or ["10"])[0]
+                self._send_json(200, call_tool("host_handoff", {"limit": raw_limit}, self.state.ctx))
+                return
             if path == "/api/obligations":
                 self._send_json(200, call_tool("obligations_verify", {}, self.state.ctx))
                 return
@@ -464,6 +469,11 @@ class HardenedWebHandler(BaseHTTPRequestHandler):
                     payload["name"] = name
                     tool_name = "launcher_remove" if op == "remove" else "launcher_build"
                     self._send_json(200, call_tool(tool_name, payload, self.state.ctx))
+                    return
+                if action == "sync":
+                    payload = dict(body)
+                    payload["name"] = name
+                    self._send_json(200, call_tool("profile_sync", payload, self.state.ctx))
                     return
             self._send_json(404, ToolError("not_found", "API route not found.", http_status=404).to_dict())
         except ToolError as exc:

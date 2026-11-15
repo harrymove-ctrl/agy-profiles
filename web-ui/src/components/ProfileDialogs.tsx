@@ -61,7 +61,9 @@ export function CreateProfileDrawer({
     e.preventDefault();
     const slug = name.trim();
     if (!slug) {
-      setErrorMsg("Enter a valid profile slug (letters, digits, dot, underscore, hyphen).");
+      setErrorMsg(
+        "Enter a valid profile slug using ASCII letters, digits, dots, underscores, or hyphens."
+      );
       return;
     }
     setSubmitting(true);
@@ -79,7 +81,9 @@ export function CreateProfileDrawer({
       });
       onOpenChange(false);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to create profile.");
+      setErrorMsg(
+        err instanceof Error ? err.message : "Failed to create profile."
+      );
     } finally {
       setSubmitting(false);
     }
@@ -89,7 +93,7 @@ export function CreateProfileDrawer({
     <Drawer
       isOpen={isOpen}
       onOpenChange={onOpenChange}
-      label="Create Sandbox Profile"
+      label="New Profile"
       side="end"
       width={460}
       purpose="form"
@@ -97,8 +101,8 @@ export function CreateProfileDrawer({
       <Layout
         header={
           <DrawerHeader
-            title="Create Sandbox Profile"
-            subtitle="Provision an isolated directory with 0700 permissions and dedicated OAuth state."
+            title="New Profile"
+            subtitle="Creates a 0700 sandbox with isolated OAuth state."
             onOpenChange={onOpenChange}
           />
         }
@@ -116,7 +120,7 @@ export function CreateProfileDrawer({
                 <FormLayout direction="vertical">
                   <TextInput
                     label="Profile Slug"
-                    description="1 to 48 ASCII letters, numbers, dots, underscores, or hyphens."
+                    description="1 to 48 ASCII letters, digits, dots, underscores, or hyphens."
                     placeholder="client-work"
                     value={name}
                     onChange={setName}
@@ -128,35 +132,16 @@ export function CreateProfileDrawer({
                     value={label}
                     onChange={setLabel}
                   />
-                  <VStack gap={1.5}>
-                    <HStack hAlign="between" vAlign="center">
-                      <Text type="label">Profile Accent</Text>
-                      <Code>{accent}</Code>
-                    </HStack>
-                    <div
-                      className="agyp-swatch-row"
-                      role="radiogroup"
-                      aria-label="New profile accent color"
-                    >
-                      {ACCENT_PRESETS.map((preset) => {
-                        const selected =
-                          accent.toUpperCase() === preset.hex.toUpperCase();
-                        return (
-                          <button
-                            key={preset.key}
-                            type="button"
-                            role="radio"
-                            aria-checked={selected}
-                            aria-label={preset.label}
-                            title={`${preset.label} (${preset.hex})`}
-                            className="agyp-swatch-button"
-                            data-accent={preset.key}
-                            onClick={() => setAccent(preset.hex)}
-                          />
-                        );
-                      })}
-                    </div>
-                  </VStack>
+                  <Selector
+                    label="Accent Color"
+                    value={accent.toUpperCase()}
+                    onChange={setAccent}
+                    options={ACCENT_PRESETS.map((preset) => ({
+                      value: preset.hex.toUpperCase(),
+                      label: preset.label,
+                      description: preset.hex,
+                    }))}
+                  />
                   <Selector
                     label="Default Target"
                     value={defaultTarget}
@@ -171,34 +156,34 @@ export function CreateProfileDrawer({
                     value={linkPolicy}
                     onChange={(v) => setLinkPolicy(v as LinkPolicy)}
                     options={[
-                      { value: "none", label: "none (Zero host links)" },
-                      { value: "minimal", label: "minimal (Fonts and safe caches)" },
-                      { value: "dev", label: "dev (Toolchain caches)" },
+                      { value: "none", label: "None (zero host links)" },
+                      { value: "minimal", label: "Minimal (fonts and safe caches)" },
+                      { value: "dev", label: "Dev (toolchain caches)" },
                     ]}
                   />
                   <Selector
-                    label="Auth Storage Mode"
+                    label="Auth Storage"
                     value={authMode}
                     onChange={(v) => setAuthMode(v as AuthMode)}
                     options={[
                       {
                         value: "isolated-file",
-                        label: "isolated-file (Isolated sandbox token)",
+                        label: "Isolated file (per-sandbox token)",
                       },
                       {
                         value: "system-keychain",
-                        label: "system-keychain (Shared login keychain)",
+                        label: "System keychain (macOS login)",
                       },
                     ]}
                   />
                   <CheckboxInput
-                    label="Inherit sanitized host GEMINI.md and MCP config"
-                    description="Fails closed if JSON is malformed; tokens and API keys are redacted."
+                    label="Copy sanitized host GEMINI.md and MCP config"
+                    description="Redacts tokens and fails closed on invalid JSON."
                     value={inheritConfig}
                     onChange={(checked) => setInheritConfig(checked)}
                   />
                   <Switch
-                    label="Keep background helper processes alive on close"
+                    label="Keep helper processes running after close"
                     value={keepBg}
                     onChange={(checked) => setKeepBg(checked)}
                   />
@@ -276,7 +261,9 @@ export function CloneProfileDrawer({
       });
       onOpenChange(false);
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Failed to clone profile.");
+      setErrorMsg(
+        err instanceof Error ? err.message : "Failed to clone profile."
+      );
     } finally {
       setSubmitting(false);
     }
@@ -286,7 +273,7 @@ export function CloneProfileDrawer({
     <Drawer
       isOpen={isOpen}
       onOpenChange={onOpenChange}
-      label="Clone Sandbox Profile"
+      label="Clone Profile"
       side="end"
       width={440}
       purpose="form"
@@ -294,8 +281,8 @@ export function CloneProfileDrawer({
       <Layout
         header={
           <DrawerHeader
-            title="Clone Sandbox Profile"
-            subtitle="Copy a stopped sandbox cleanly while skipping transient locks and symlinks."
+            title="Clone Profile"
+            subtitle="Copies a stopped profile without locks or symlinks."
             onOpenChange={onOpenChange}
           />
         }
@@ -311,7 +298,7 @@ export function CloneProfileDrawer({
                   />
                 ) : null}
                 <HStack gap={2} vAlign="center">
-                  <Text type="label">Source profile:</Text>
+                  <Text type="label">Source:</Text>
                   <Code>{sourceName ?? ""}</Code>
                 </HStack>
                 <FormLayout direction="vertical">
