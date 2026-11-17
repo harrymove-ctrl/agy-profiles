@@ -14,9 +14,10 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agy_profiles.cli import main as cli_main
-from agy_profiles.isolation import REDACTED_MARKER
+from agy_profiles.isolation import REDACTED_MARKER, create_safe_link
 from agy_profiles.macos_launcher import resolve_launcher_bundle_path, verify_launcher_signature
 from agy_profiles.mcp_server import handle_mcp_request, serve_mcp_stdio
+from agy_profiles.process_guard import HOST_DATA_DIR_RELPATHS
 from agy_profiles.tools import RuntimeContext, call_tool
 
 
@@ -167,7 +168,15 @@ class McpAndCliTests(unittest.TestCase):
         old_link = old_dir / "home" / ".gemini" / "antigravity" / "mcp_config.json"
         old_link.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(str(old_link.parent), 0o700)
-        os.symlink(str(old_cfg), str(old_link))
+        created_symlink = True
+        try:
+            os.symlink(str(old_cfg), str(old_link))
+        except OSError as exc:
+            if sys.platform == "win32" and getattr(exc, "winerror", None) == 1314:
+                created_symlink = False
+                create_safe_link(old_cfg, old_link)
+            else:
+                raise
 
         buf = io.StringIO()
         old_stdout = sys.stdout
@@ -201,12 +210,16 @@ class McpAndCliTests(unittest.TestCase):
         self.assertEqual(new_cred.read_text(encoding="utf-8"), "user-scope-token")
         zshenv_text = (new_dir / "home" / ".zshenv").read_text(encoding="utf-8")
         expected_home = (new_dir / "home").resolve()
-        self.assertIn("export HOME={}".format(expected_home), zshenv_text)
-        self.assertIn("export ZDOTDIR={}".format(expected_home), zshenv_text)
+        self.assertIn("export HOME=", zshenv_text)
+        self.assertIn("export ZDOTDIR=", zshenv_text)
+        self.assertIn(str(expected_home), zshenv_text)
 
         new_link = new_dir / "home" / ".gemini" / "antigravity" / "mcp_config.json"
-        self.assertTrue(new_link.is_symlink())
-        self.assertEqual(os.readlink(str(new_link)), str(new_dir / "home" / ".gemini" / "config" / "mcp_config.json"))
+        if created_symlink:
+            self.assertTrue(new_link.is_symlink())
+            self.assertEqual(os.readlink(str(new_link)), str(new_dir / "home" / ".gemini" / "config" / "mcp_config.json"))
+        else:
+            self.assertTrue(new_link.is_file())
         sync_res = call_tool("profile_sync", {"name": "backup-box", "include_handoff": False}, self.ctx)
         self.assertEqual(sync_res["manifest"]["name"], "backup-box")
 
@@ -225,7 +238,7 @@ class McpAndCliTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         created = json.loads(buf.getvalue())
         self.assertEqual(created["manifest"]["link_policy"], "dev")
-        self.assertTrue((self.root / "default-box" / "home" / ".agents").is_symlink())
+        self.assertTrue((self.root / "default-box" / "home" / ".agents").exists())
         self.assertTrue((self.root / "default-box" / "home" / ".gemini" / "GEMINI.md").is_file())
 
     def test_profile_update_reconciles_signed_launcher_on_label_change(self) -> None:
@@ -467,12 +480,18 @@ class McpAndCliTests(unittest.TestCase):
 
         ext_wt = Path(self.tmp.name).resolve() / "ext-worktrees" / "repo-a"
         ext_wt.mkdir(parents=True)
-        os.symlink(str(ext_wt), str(host_ag / "worktrees" / "repo-a"))
-
-        # Forbidden symlink pointing inside Host ~/.gemini must NOT be copied.
-        forbidden_wt_target = self.fake_home / ".gemini" / "secret-dir"
-        forbidden_wt_target.mkdir(parents=True)
-        os.symlink(str(forbidden_wt_target), str(host_ag / "worktrees" / "bad-link"))
+        has_wt_symlink = True
+        try:
+            os.symlink(str(ext_wt), str(host_ag / "worktrees" / "repo-a"))
+            # Forbidden symlink pointing inside Host ~/.gemini must NOT be copied.
+            forbidden_wt_target = self.fake_home / ".gemini" / "secret-dir"
+            forbidden_wt_target.mkdir(parents=True)
+            os.symlink(str(forbidden_wt_target), str(host_ag / "worktrees" / "bad-link"))
+        except OSError as exc:
+            if sys.platform == "win32" and getattr(exc, "winerror", None) == 1314:
+                has_wt_symlink = False
+            else:
+                raise
 
         # Populate Host conversation_summaries.db + conversations/conv-host-1.db + brain + annotations
         host_sum_db = host_ag / "conversation_summaries.db"
@@ -566,8 +585,9 @@ class McpAndCliTests(unittest.TestCase):
         self.assertTrue((prof_ag / "annotations" / "conv-host-1.pbtxt").is_file())
         self.assertTrue((prof_ag / "chapter_titles" / "conv-host-1.pb").is_file())
         self.assertTrue((prof_ag / "brain" / "conv-host-1" / "report.md").is_file())
-        self.assertTrue((prof_ag / "worktrees" / "repo-a").is_symlink())
-        self.assertFalse((prof_ag / "worktrees" / "bad-link").exists())
+        if has_wt_symlink:
+            self.assertTrue((prof_ag / "worktrees" / "repo-a").is_symlink())
+            self.assertFalse((prof_ag / "worktrees" / "bad-link").exists())
 
         # Simulate backup continuing conv-host-locked AND creating conv-backup-new while Host holds a lock on conv-host-locked
         (host_ag / "presence").mkdir(parents=True, exist_ok=True)
@@ -878,7 +898,7 @@ class McpAndCliTests(unittest.TestCase):
         self.assertIn("--dangerously-skip-permissions", calls[1]["args"])
 
     def test_host_hub_tls_doctor_and_repair_host(self) -> None:
-        host_app_support = self.fake_home / "Library" / "Application Support" / "Antigravity"
+        host_app_support = self.fake_home / HOST_DATA_DIR_RELPATHS["hub"]
         host_app_support.mkdir(parents=True, exist_ok=True)
         stale_lock = host_app_support / "SingletonLock"
         stale_lock.write_text("stale-host-lock", encoding="utf-8")

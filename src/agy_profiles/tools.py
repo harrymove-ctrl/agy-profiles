@@ -47,6 +47,7 @@ from agy_profiles.isolation import (
     audit_profile_isolation,
     collect_handoff_from_gemini,
     collect_host_handoff,
+    create_safe_link,
     detect_host_account,
     detect_profile_account,
     inherit_host_customizations,
@@ -880,7 +881,7 @@ def _retarget_internal_symlinks(src_dir: Path, dst_dir: Path) -> int:
                     break
             if new_target != raw_target:
                 os.unlink(full_path)
-                os.symlink(new_target, full_path)
+                create_safe_link(Path(new_target), Path(full_path))
                 count += 1
     return count
 
@@ -1099,20 +1100,31 @@ def _inspect_git_dirty(workspace: Optional[str]) -> Dict[str, Any]:
 
 
 def _copy_prompt_to_clipboard(prompt_text: str, copy_prompt: bool) -> bool:
-    if not (copy_prompt and prompt_text and sys.platform == "darwin" and Path("/usr/bin/pbcopy").exists()):
+    if not (copy_prompt and prompt_text):
         return False
     try:
-        cp_proc = subprocess.run(
-            ["/usr/bin/pbcopy"],
-            input=prompt_text,
-            text=True,
-            capture_output=True,
-            timeout=3,
-            check=False,
-        )
-        return cp_proc.returncode == 0
+        if sys.platform == "darwin" and Path("/usr/bin/pbcopy").exists():
+            cp_proc = subprocess.run(
+                ["/usr/bin/pbcopy"],
+                input=prompt_text,
+                text=True,
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+            return cp_proc.returncode == 0
+        if sys.platform == "win32":
+            cp_proc = subprocess.run(
+                ["clip"],
+                input=prompt_text.encode("utf-16le"),
+                capture_output=True,
+                timeout=3,
+                check=False,
+            )
+            return cp_proc.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+    return False
 
 
 def _handle_switch_to_host(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1533,10 +1545,10 @@ def _handle_obligations_verify(_ctx: RuntimeContext, _params: Dict[str, Any]) ->
         # 2. Path containment
         safe_root = tmp_path / "root"
         safe_root.mkdir(parents=True)
-        outside_file = tmp_path / "outside.txt"
-        outside_file.write_text("secret", encoding="utf-8")
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir(parents=True)
         escape_link = safe_root / "escape"
-        os.symlink(str(outside_file), str(escape_link))
+        create_safe_link(outside_dir, escape_link)
         contained_ok = False
         escape_blocked = False
         try:

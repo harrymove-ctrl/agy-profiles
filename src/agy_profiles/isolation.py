@@ -11,6 +11,8 @@ import shlex
 import shutil
 import socket
 import sqlite3
+import subprocess
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import uuid
@@ -149,6 +151,32 @@ def _write_sandbox_zshenv(sandbox_home: Path, real_home: Path) -> None:
     atomic_write_text(zshenv_path, script, mode=0o600)
 
 
+def create_safe_link(src: Path, dst: Path) -> bool:
+    """Create a symlink, falling back to NTFS junction/hardlink/copy on Windows without symlink privilege."""
+    is_dir = src.is_dir()
+    try:
+        os.symlink(str(src), str(dst), target_is_directory=is_dir)
+        return True
+    except OSError as exc:
+        if sys.platform != "win32" or getattr(exc, "winerror", None) != 1314:
+            raise
+    if is_dir:
+        proc = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(dst), str(src)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        return proc.returncode == 0
+    try:
+        os.link(str(src), str(dst))
+        return True
+    except OSError:
+        shutil.copy2(str(src), str(dst))
+        return True
+
+
 def _reconcile_policy_symlinks(
     sandbox_home: Path,
     real_home: Path,
@@ -169,9 +197,9 @@ def _reconcile_policy_symlinks(
                 if slot.is_symlink():
                     if os.readlink(str(slot)) != str(src):
                         slot.unlink()
-                        os.symlink(str(src), str(slot))
+                        create_safe_link(src, slot)
                 elif not slot.exists():
-                    os.symlink(str(src), str(slot))
+                    create_safe_link(src, slot)
                 linked.append(clean_rel)
             else:
                 skipped_missing.append(clean_rel)
@@ -179,6 +207,12 @@ def _reconcile_policy_symlinks(
             if slot.is_symlink():
                 slot.unlink()
                 removed.append(clean_rel)
+            elif sys.platform == "win32" and slot.is_dir():
+                try:
+                    os.rmdir(str(slot))
+                    removed.append(clean_rel)
+                except OSError:
+                    pass
     return {"linked": linked, "removed": removed, "skipped_missing": skipped_missing}
 
 
@@ -454,8 +488,11 @@ def _scrub_structure(node: Any, force_redact: bool = False) -> Tuple[Any, int]:
 
 def sanitize_mcp_json_text(raw_text: str, source_path: str = "mcp_config.json") -> Tuple[Dict[str, Any], int]:
     """Strictly parse MCP JSON and scrub secrets; never fall back to raw file copying."""
+    cleaned_text = raw_text.lstrip("\ufeff")
+    if not cleaned_text.strip():
+        return {}, 0
     try:
-        parsed = json.loads(raw_text)
+        parsed = json.loads(cleaned_text)
     except json.JSONDecodeError as exc:
         raise ToolError(
             "mcp_config_malformed",
@@ -1679,10 +1716,10 @@ def _sync_single_session_store(
             if dst_slot.is_symlink():
                 if os.readlink(str(dst_slot)) != str(resolved_wt):
                     dst_slot.unlink()
-                    os.symlink(str(resolved_wt), str(dst_slot))
+                    create_safe_link(resolved_wt, dst_slot)
                     wt_linked += 1
             elif not dst_slot.exists():
-                os.symlink(str(resolved_wt), str(dst_slot))
+                create_safe_link(resolved_wt, dst_slot)
                 wt_linked += 1
 
     src_conn: Optional[sqlite3.Connection] = None

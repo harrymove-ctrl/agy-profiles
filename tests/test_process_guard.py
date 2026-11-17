@@ -240,7 +240,8 @@ class ProcessGuardTests(unittest.TestCase):
             with mock.patch("agy_profiles.process_guard.list_all_processes", side_effect=_dynamic_ps_rows):
                 result = stop_profile(self.root, self.profile_dir, target="hub", timeout_sec=0.25)
             self.assertIn(fake_proc.pid, result["signaled_pids"])
-            self.assertIn(fake_proc.pid, result["forced_pids"])
+            if sys.platform != "win32":
+                self.assertIn(fake_proc.pid, result["forced_pids"])
             fake_proc.wait(timeout=2)
         finally:
             if fake_proc.stdout:

@@ -163,7 +163,7 @@ def resolve_real_host_home(
     """Return real OS user home when invoked from inside an isolated sandbox profile."""
     if explicit_home is not None and str(explicit_home).strip() != "":
         return Path(explicit_home).expanduser()
-    if profiles_root is None or pwd is None:
+    if profiles_root is None:
         return None
     try:
         current_home = Path.home().resolve()
@@ -171,12 +171,22 @@ def resolve_real_host_home(
         current_home.relative_to(root_resolved)
     except (ValueError, OSError):
         return None
-    try:
-        pw_dir = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
-        if pw_dir != current_home:
-            return pw_dir
-    except (KeyError, OSError):
-        pass
+    if pwd is not None:
+        try:
+            pw_dir = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+            if pw_dir != current_home:
+                return pw_dir
+        except (KeyError, OSError):
+            pass
+    elif sys.platform == "win32":
+        user_profile = os.environ.get("USERPROFILE", "").strip()
+        if user_profile:
+            try:
+                up_dir = Path(user_profile).resolve()
+                if up_dir != current_home:
+                    return up_dir
+            except OSError:
+                pass
     return None
 
 
@@ -339,8 +349,63 @@ def _inspect_app_bundle(
     )
 
 
+def _inspect_windows_app(
+    kind: str,
+    display_name: str,
+    candidates: List[Path],
+    exe_names: Tuple[str, ...],
+) -> TargetInfo:
+    for candidate in candidates:
+        exe_path: Optional[Path] = None
+        app_dir: Optional[Path] = None
+        if candidate.is_file() and candidate.suffix.lower() == ".exe":
+            exe_path = candidate
+            app_dir = candidate.parent
+        elif candidate.is_dir():
+            app_dir = candidate
+            for exe_name in exe_names:
+                probe = candidate / exe_name
+                if probe.is_file():
+                    exe_path = probe
+                    break
+        if exe_path is not None and app_dir is not None:
+            version = ""
+            ver_file = app_dir / "version"
+            if ver_file.is_file():
+                try:
+                    version = ver_file.read_text(encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    pass
+            if not version:
+                pkg_file = app_dir / "resources" / "app" / "package.json"
+                if pkg_file.is_file():
+                    try:
+                        pkg = json.loads(pkg_file.read_text(encoding="utf-8", errors="replace"))
+                        version = str(pkg.get("version") or "")
+                    except (OSError, ValueError):
+                        pass
+            return TargetInfo(
+                kind=kind,
+                display_name=display_name,
+                app_path=str(app_dir),
+                binary_path=str(exe_path),
+                bundle_id="",
+                version=version or "unknown",
+                installed=True,
+            )
+    return TargetInfo(
+        kind=kind,
+        display_name=display_name,
+        app_path=None,
+        binary_path=None,
+        bundle_id="",
+        version="",
+        installed=False,
+    )
+
+
 def detect_targets() -> Dict[str, TargetInfo]:
-    """Detect installed Antigravity Hub and Antigravity IDE macOS bundles."""
+    """Detect installed Antigravity Hub and Antigravity IDE bundles/executables."""
     hub_candidates: List[Path] = []
     ide_candidates: List[Path] = []
     hub_env = os.environ.get("AGY_HUB_APP", "").strip()
@@ -349,6 +414,27 @@ def detect_targets() -> Dict[str, TargetInfo]:
     ide_env = os.environ.get("AGY_IDE_APP", "").strip()
     if ide_env:
         ide_candidates.append(Path(ide_env).expanduser())
+
+    if sys.platform == "win32":
+        local_app = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        prog_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        hub_candidates.extend(
+            [
+                local_app / "Programs" / "Antigravity" / "Antigravity.exe",
+                prog_files / "Antigravity" / "Antigravity.exe",
+            ]
+        )
+        ide_candidates.extend(
+            [
+                local_app / "Programs" / "Antigravity IDE" / "Antigravity IDE.exe",
+                prog_files / "Antigravity IDE" / "Antigravity IDE.exe",
+                local_app / "Programs" / "Antigravity" / "Antigravity IDE.exe",
+            ]
+        )
+        return {
+            "hub": _inspect_windows_app("hub", "Antigravity Hub", hub_candidates, ("Antigravity.exe",)),
+            "ide": _inspect_windows_app("ide", "Antigravity IDE", ide_candidates, ("Antigravity IDE.exe", "Electron.exe")),
+        }
 
     home = Path.home()
     hub_candidates.extend(
