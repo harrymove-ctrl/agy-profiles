@@ -488,8 +488,11 @@ def _scrub_structure(node: Any, force_redact: bool = False) -> Tuple[Any, int]:
 
 def sanitize_mcp_json_text(raw_text: str, source_path: str = "mcp_config.json") -> Tuple[Dict[str, Any], int]:
     """Strictly parse MCP JSON and scrub secrets; never fall back to raw file copying."""
+    cleaned_text = raw_text.lstrip("\ufeff")
+    if not cleaned_text.strip():
+        return {}, 0
     try:
-        parsed = json.loads(raw_text)
+        parsed = json.loads(cleaned_text)
     except json.JSONDecodeError as exc:
         raise ToolError(
             "mcp_config_malformed",
