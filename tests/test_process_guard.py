@@ -17,6 +17,7 @@ from agy_profiles.isolation import provision_profile_dirs
 from agy_profiles.process_guard import (
     command_matches_host_target,
     command_matches_user_data_dir,
+    heal_electron_compositor,
     inspect_host_runtime,
     inspect_locks,
     launch_profile,
@@ -247,6 +248,60 @@ class ProcessGuardTests(unittest.TestCase):
             if fake_proc.poll() is None:
                 fake_proc.kill()
                 fake_proc.wait(timeout=2)
+
+    def test_heal_electron_compositor_recycles_gpu_only_and_preserves_sessions(self) -> None:
+        gpu_cache = Path(self.data_dir) / "GPUCache"
+        gpu_cache.mkdir(parents=True, exist_ok=True)
+        shader_blob = gpu_cache / "data_0"
+        shader_blob.write_bytes(b"corrupted-metal-pipeline")
+
+        fake_rows = [
+            {
+                "pid": 1001,
+                "ppid": 1,
+                "pgid": 1001,
+                "command": "/Applications/Antigravity.app/Contents/MacOS/Antigravity --user-data-dir={}".format(self.data_dir),
+            },
+            {
+                "pid": 1002,
+                "ppid": 1001,
+                "pgid": 1001,
+                "command": "/Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone",
+            },
+            {
+                "pid": 1003,
+                "ppid": 1001,
+                "pgid": 1001,
+                "command": "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app/Contents/MacOS/Antigravity Helper --type=gpu-process --user-data-dir={}".format(self.data_dir),
+            },
+            {
+                "pid": 1004,
+                "ppid": 1001,
+                "pgid": 1001,
+                "command": "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (Renderer).app/Contents/MacOS/Antigravity Helper (Renderer) --type=renderer --user-data-dir={}".format(self.data_dir),
+            },
+        ]
+
+        killed: list[tuple[int, int]] = []
+
+        def _fake_kill(pid: int, sig: int) -> None:
+            killed.append((pid, sig))
+
+        with mock.patch("agy_profiles.process_guard.os.kill", side_effect=_fake_kill), \
+             mock.patch("agy_profiles.process_guard.time.sleep"):
+            res = heal_electron_compositor(
+                scope="work",
+                target="hub",
+                deep=False,
+                root=self.root,
+                ps_rows=fake_rows,
+            )
+
+        self.assertEqual(res["recycled_gpu_pids"], [1003])
+        self.assertEqual(res["recycled_renderer_pids"], [])
+        self.assertEqual(res["preserved_root_pids"], [1001])
+        self.assertFalse(shader_blob.exists())
+        self.assertEqual([p for p, _ in killed], [1003])
 
 
 if __name__ == "__main__":

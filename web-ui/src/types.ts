@@ -377,3 +377,14 @@ export interface RenameProfilePayload {
   label?: string;
   restart?: boolean;
 }
+
+export interface HealScreenResponse {
+  scope: string;
+  target: string;
+  deep: boolean;
+  recycled_gpu_pids: number[];
+  recycled_renderer_pids: number[];
+  preserved_root_pids: number[];
+  cleared_shader_caches: string[];
+  healed_at: string;
+}

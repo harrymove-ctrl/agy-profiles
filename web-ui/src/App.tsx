@@ -30,6 +30,7 @@ import type {
   CreateProfilePayload,
   DoctorResponse,
   HandoffResponse,
+  HealScreenResponse,
   ObligationsResponse,
   OverviewResponse,
   ProfileDetail,
@@ -700,6 +701,27 @@ function ConsoleShell({
     }
   };
 
+  const handleHealScreen = async () => {
+    setActionBusy("heal");
+    try {
+      const res = await apiFetch<HealScreenResponse>("/api/heal", {
+        method: "POST",
+        body: { scope: "all", target: "all", deep: false },
+      });
+      const gpuCount = res.recycled_gpu_pids.length;
+      const cacheCount = res.cleared_shader_caches.length;
+      toast({
+        body: `Healed Antigravity compositor (${gpuCount} GPU ${pluralize(gpuCount, "helper")}, ${cacheCount} shader ${pluralize(cacheCount, "cache")} cleared) with zero sessions stopped.`,
+        type: "info",
+      });
+      await refreshState(selectedName);
+    } catch (err) {
+      reportError(err, "Failed to heal Antigravity screen.");
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
   const profiles = overview?.profiles ?? [];
   const targets = overview?.targets ?? null;
 
@@ -721,9 +743,11 @@ function ConsoleShell({
             themeSlug={themeSlug}
             isDarkOnlyTheme={isDarkOnlyTheme}
             resolvedMode={resolvedMode}
+            healBusy={actionBusy === "heal"}
             onViewChange={handleViewChange}
             onThemeChange={onThemeChange}
             onToggleColorMode={onToggleColorMode}
+            onHealScreen={() => void handleHealScreen()}
             onOpenCreate={() => setCreateOpen(true)}
           />
         }

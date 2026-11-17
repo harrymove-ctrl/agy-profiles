@@ -2087,69 +2087,42 @@ def _read_paused_host_sidecar_ids(host_gemini: Path) -> List[str]:
 
 
 def pause_host_automations(real_home: Optional[Path] = None) -> Dict[str, Any]:
-    """Pause enabled Host schedule sidecars during backup quota takeover and record exact IDs."""
-    host_home = (real_home if real_home is not None else Path.home()).resolve()
-    host_gemini = ensure_within_root(host_home, host_home / ".gemini")
-    cfg_path = host_gemini / "config" / "config.json"
-    if not cfg_path.is_file() or cfg_path.is_symlink():
-        return {"paused_count": 0, "paused_ids": []}
-    parsed = _read_json_safe(cfg_path)
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("sidecars"), dict):
-        return {"paused_count": 0, "paused_ids": []}
-
-    live_sidecars = _collect_live_sidecars(host_gemini, host_home=host_home)
-    raw_sidecars = dict(parsed["sidecars"])
-    prev_ids = set(_read_paused_host_sidecar_ids(host_gemini))
-    now_enabled: List[str] = []
-    for sid in sorted(live_sidecars.keys()):
-        entry = raw_sidecars.get(sid)
-        if isinstance(entry, dict) and bool(entry.get("enabled", False)):
-            now_enabled.append(sid)
-            updated_entry = dict(entry)
-            updated_entry["enabled"] = False
-            raw_sidecars[sid] = updated_entry
-
-    combined_ids = sorted(prev_ids.union(now_enabled))
-    if combined_ids:
-        ledger = ensure_within_root(host_home, host_gemini / "config" / PAUSED_HOST_SIDECARS_FILE)
-        atomic_write_json(
-            ledger,
-            {"paused_ids": combined_ids, "paused_at": utc_now_iso()},
-            mode=0o600,
-        )
-    if now_enabled:
-        parsed_copy = dict(parsed)
-        parsed_copy["sidecars"] = raw_sidecars
-        atomic_write_json(ensure_within_root(host_home, cfg_path), parsed_copy, mode=0o600)
-    return {"paused_count": len(combined_ids), "paused_ids": combined_ids}
-
-
-def restore_host_automations(real_home: Optional[Path] = None) -> Dict[str, Any]:
-    """Re-enable exact Host schedule sidecars recorded before quota takeover."""
+    """Never disable Host schedule sidecars; inspect enabled IDs read-only and leave Host config.json untouched."""
     host_home = (real_home if real_home is not None else Path.home()).resolve()
     host_gemini = ensure_within_root(host_home, host_home / ".gemini")
     ledger = host_gemini / "config" / PAUSED_HOST_SIDECARS_FILE
-    paused_ids = _read_paused_host_sidecar_ids(host_gemini)
-    cfg_path = host_gemini / "config" / "config.json"
-    restored: List[str] = []
-    if paused_ids and cfg_path.is_file() and not cfg_path.is_symlink():
-        parsed = _read_json_safe(cfg_path)
-        if isinstance(parsed, dict) and isinstance(parsed.get("sidecars"), dict):
-            raw_sidecars = dict(parsed["sidecars"])
-            for sid in paused_ids:
-                entry = raw_sidecars.get(sid)
-                if isinstance(entry, dict):
-                    updated_entry = dict(entry)
-                    updated_entry["enabled"] = True
-                    raw_sidecars[sid] = updated_entry
-                    restored.append(sid)
-            if restored:
-                parsed_copy = dict(parsed)
-                parsed_copy["sidecars"] = raw_sidecars
-                atomic_write_json(ensure_within_root(host_home, cfg_path), parsed_copy, mode=0o600)
     if ledger.is_file() and not ledger.is_symlink():
         ensure_within_root(host_home, ledger).unlink()
-    return {"restored_count": len(restored), "restored_ids": restored}
+    cfg_path = host_gemini / "config" / "config.json"
+    if not cfg_path.is_file() or cfg_path.is_symlink():
+        return {"paused_count": 0, "paused_ids": [], "observed_enabled_ids": [], "host_automations_preserved": True}
+    parsed = _read_json_safe(cfg_path)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("sidecars"), dict):
+        return {"paused_count": 0, "paused_ids": [], "observed_enabled_ids": [], "host_automations_preserved": True}
+
+    live_sidecars = _collect_live_sidecars(host_gemini, host_home=host_home)
+    raw_sidecars = parsed["sidecars"]
+    now_enabled = [
+        sid
+        for sid in sorted(live_sidecars.keys())
+        if isinstance(raw_sidecars.get(sid), dict) and bool(raw_sidecars[sid].get("enabled", False))
+    ]
+    return {
+        "paused_count": 0,
+        "paused_ids": [],
+        "observed_enabled_ids": now_enabled,
+        "host_automations_preserved": True,
+    }
+
+
+def restore_host_automations(real_home: Optional[Path] = None) -> Dict[str, Any]:
+    """Clean up legacy paused-sidecar ledger without modifying Host config.json."""
+    host_home = (real_home if real_home is not None else Path.home()).resolve()
+    host_gemini = ensure_within_root(host_home, host_home / ".gemini")
+    ledger = host_gemini / "config" / PAUSED_HOST_SIDECARS_FILE
+    if ledger.is_file() and not ledger.is_symlink():
+        ensure_within_root(host_home, ledger).unlink()
+    return {"restored_count": 0, "restored_ids": [], "host_automations_preserved": True}
 
 
 def sync_host_customizations(
@@ -2314,7 +2287,6 @@ def sync_host_customizations(
     # Sync or strip Host scheduled Automations: write config/config.json first so a running
     # sandbox language_server sees enabled=False before new sidecar.json files appear on disk.
     live_sidecars = _collect_live_sidecars(host_gemini, host_home=host_home)
-    paused_host_set = set(_read_paused_host_sidecar_ids(host_gemini))
     host_cfg_json = host_gemini / "config" / "config.json"
     parsed_cfg: Optional[Any] = (
         _read_json_safe(host_cfg_json)
@@ -2359,19 +2331,13 @@ def sync_host_customizations(
                         entry_copy = dict(rewritten_entry) if isinstance(rewritten_entry, dict) else {}
                         if mode == "paused":
                             entry_copy["enabled"] = False
-                        elif paused_host_set:
-                            entry_copy["enabled"] = key_str in paused_host_set
                         new_sidecars[key_str] = entry_copy
                     else:
                         stripped_sidecars += 1
             for sid in live_sidecars:
                 if sid not in new_sidecars:
                     new_sidecars[sid] = {
-                        "enabled": (
-                            False
-                            if mode == "paused"
-                            else ((sid in paused_host_set) if paused_host_set else True)
-                        ),
+                        "enabled": False if mode == "paused" else True,
                         "schemaVersion": 1,
                     }
             parsed_cfg["sidecars"] = new_sidecars

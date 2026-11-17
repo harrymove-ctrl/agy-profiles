@@ -12,6 +12,7 @@ from typing import Iterable, List, Tuple
 
 SCAN_EXTENSIONS = {
     ".py",
+    ".rs",
     ".sh",
     ".js",
     ".css",

@@ -171,6 +171,30 @@ run_cmd mkdir -p "${PREFIX}"
 install_repo_link "${BIN_PRIMARY}" "${PREFIX}/agy-profiles"
 install_repo_link "${BIN_ALIAS}" "${PREFIX}/agyp"
 
+RUST_CRATE="${SCRIPT_DIR}/rust/agyp-guard/Cargo.toml"
+CARGO_BIN="$(command -v cargo || true)"
+if [[ -z "${CARGO_BIN}" && -x "${HOME}/.cargo/bin/cargo" ]]; then
+    CARGO_BIN="${HOME}/.cargo/bin/cargo"
+fi
+if [[ -f "${RUST_CRATE}" && -n "${CARGO_BIN}" ]]; then
+    if [[ -d "/Volumes/Dev" && -w "/Volumes/Dev" ]]; then
+        GUARD_TARGET="/Volumes/Dev/.cargo-target-agyp"
+    else
+        GUARD_TARGET="${SCRIPT_DIR}/rust/agyp-guard/target"
+    fi
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        printf '[dry-run] CARGO_TARGET_DIR=%s %s build --release --manifest-path %s\n' "${GUARD_TARGET}" "${CARGO_BIN}" "${RUST_CRATE}"
+    else
+        CARGO_TARGET_DIR="${GUARD_TARGET}" "${CARGO_BIN}" build --release --manifest-path "${RUST_CRATE}" >/dev/null
+        cp "${GUARD_TARGET}/release/agyp-guard" "${PREFIX}/agyp-guard"
+        chmod 755 "${PREFIX}/agyp-guard"
+        if [[ -x "/usr/bin/codesign" ]]; then
+            /usr/bin/codesign --force --sign - "${PREFIX}/agyp-guard" >/dev/null 2>&1 || true
+        fi
+        echo "Built native Rust guardian: ${PREFIX}/agyp-guard"
+    fi
+fi
+
 if [[ "${WITH_SKILL}" -eq 1 ]]; then
     if [[ -d "${SKILL_SRC}" ]]; then
         run_cmd mkdir -p "${SKILL_DIR}"

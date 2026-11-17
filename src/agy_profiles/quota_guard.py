@@ -23,7 +23,7 @@ QUOTA_EXHAUSTED_LINE_RE = re.compile(
 )
 
 IGNORED_LOG_NOISE_RE = re.compile(
-    r"(?:runner\.go:|Monitor\s+sir_|severe_internal_risks)",
+    r"(?:runner\.go:|Monitor\s+sir_|severe_internal_risks|Individual\s+quota\s+reached|quota_pause\.go:|native\s+swarm:)",
     re.IGNORECASE,
 )
 

@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from agy_profiles import __version__
 from agy_profiles.config import atomic_write_json
 from agy_profiles.errors import ToolError
+from agy_profiles.process_guard import heal_electron_compositor
 from agy_profiles.tools import RuntimeContext, call_tool
 
 ALLOWED_BIND_HOSTS = ("127.0.0.1", "::1")
@@ -680,6 +681,23 @@ class HardenedWebHandler(BaseHTTPRequestHandler):
 
         parts = [unquote(seg) for seg in parsed.path.split("/") if seg]
         try:
+            if parts == ["api", "heal"]:
+                scope = str(body.get("scope") or "all")
+                target = str(body.get("target") or "all")
+                deep = bool(body.get("deep", False))
+                try:
+                    call_tool("host_handoff", {"limit": 15, "source": "host"}, self.state.ctx)
+                except ToolError:
+                    pass
+                res = heal_electron_compositor(
+                    scope=scope,
+                    target=target,
+                    deep=deep,
+                    root=self.state.ctx.root,
+                    real_home=self.state.ctx.real_home,
+                )
+                self._send_json(200, res)
+                return
             if parts == ["api", "profiles"]:
                 created = call_tool("profile_create", body, self.state.ctx)
                 self._send_json(201, created)

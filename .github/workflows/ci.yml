@@ -35,6 +35,14 @@ jobs:
           test -x bin/agyp
           bash install.sh --dry-run
 
+      - name: Test, lint, and build native Rust agyp-guard
+        if: matrix.python-version == '3.13'
+        run: |
+          cd rust/agyp-guard
+          cargo test
+          cargo clippy --all-targets -- -D warnings
+          cargo build --release
+
       - name: Build web-ui, audit Astryx purity, and verify zero web_static drift
         if: matrix.python-version == '3.13'
         run: |

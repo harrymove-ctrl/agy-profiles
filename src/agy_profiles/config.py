@@ -7,6 +7,10 @@ import json
 import os
 from pathlib import Path
 import plistlib
+try:
+    import pwd
+except ImportError:  # pragma: no cover
+    pwd = None  # type: ignore[assignment]
 import re
 import sys
 import tempfile
@@ -150,6 +154,30 @@ def resolve_profiles_root(explicit_root: Optional[Union[str, Path]] = None) -> P
         except OSError:
             pass
     return Path.home() / ".antigravity-profiles"
+
+
+def resolve_real_host_home(
+    explicit_home: Optional[Union[str, Path]] = None,
+    profiles_root: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return real OS user home when invoked from inside an isolated sandbox profile."""
+    if explicit_home is not None and str(explicit_home).strip() != "":
+        return Path(explicit_home).expanduser()
+    if profiles_root is None or pwd is None:
+        return None
+    try:
+        current_home = Path.home().resolve()
+        root_resolved = profiles_root.expanduser().resolve()
+        current_home.relative_to(root_resolved)
+    except (ValueError, OSError):
+        return None
+    try:
+        pw_dir = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        if pw_dir != current_home:
+            return pw_dir
+    except (KeyError, OSError):
+        pass
+    return None
 
 
 def ensure_within_root(root: Path, candidate: Path) -> Path:

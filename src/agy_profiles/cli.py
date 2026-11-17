@@ -19,6 +19,7 @@ from agy_profiles.config import (
     ensure_within_root,
     load_manifest,
     resolve_profiles_root,
+    resolve_real_host_home,
     validate_profile_name,
 )
 from agy_profiles.daemon import (
@@ -28,12 +29,15 @@ from agy_profiles.daemon import (
     get_owner_console_url,
     install_daemons,
     open_daemon_console,
+    read_guard_telemetry,
+    run_guard_once,
     uninstall_daemons,
 )
 from agy_profiles.errors import ToolError
 from agy_profiles.evidence import utc_now_iso
 from agy_profiles.isolation import provision_profile_dirs
 from agy_profiles.mcp_server import serve_mcp_stdio
+from agy_profiles.process_guard import heal_electron_compositor
 from agy_profiles.quota_guard import (
     host_quota_log_paths,
     poll_auto_failover_once,
@@ -141,10 +145,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_repair = sub.add_parser(
         "repair",
         parents=[common_sub],
-        help="Remove stale lock files and reconcile .zshenv permissions.",
+        help="Remove stale lock files, reconcile .zshenv permissions, or heal Host Hub.",
     )
-    p_repair.add_argument("name")
+    p_repair.add_argument("name", help="Profile slug or 'host'.")
     p_repair.add_argument("--target", choices=("hub", "ide"))
+    p_repair.add_argument(
+        "--no-launch",
+        action="store_true",
+        default=False,
+        dest="no_launch",
+        help="Clean Host locks without relaunching Antigravity.app when repairing 'host'.",
+    )
 
     p_clone = sub.add_parser("clone", parents=[common_sub], help="Clone a stopped profile to a new profile slug.")
     p_clone.add_argument("source")
@@ -414,6 +425,43 @@ def _build_parser() -> argparse.ArgumentParser:
     p_daemon.add_argument("--no-open", action="store_true", default=False, help="Do not open browser automatically.")
     p_daemon.add_argument("--dry-run", action="store_true", default=False, help="Write plist files without calling launchctl.")
 
+    p_guard = sub.add_parser(
+        "guard",
+        parents=[common_sub],
+        help="Inspect or trigger the native Rust CPU, GPU, unified memory, and orphan PID guardian.",
+    )
+    p_guard.add_argument(
+        "guard_action",
+        nargs="?",
+        choices=("status", "once"),
+        default="status",
+        help="Guardian action: status (read live telemetry) or once (run immediate hardware and PID sweep).",
+    )
+
+    p_heal = sub.add_parser(
+        "heal",
+        parents=[common_sub],
+        help="Fix black Antigravity windows without Cmd+Q by purging shader caches and recycling GPU compositors while keeping sessions alive.",
+    )
+    p_heal.add_argument(
+        "scope",
+        nargs="?",
+        default="all",
+        help="Scope to heal: all (default), host, or a profile slug.",
+    )
+    p_heal.add_argument(
+        "--target",
+        choices=("hub", "ide", "all"),
+        default="all",
+        help="Runtime target to heal: hub, ide, or all (default: all).",
+    )
+    p_heal.add_argument(
+        "--deep",
+        action="store_true",
+        default=False,
+        help="Also recycle frozen renderer helpers while keeping root Electron, language_server, and terminals alive.",
+    )
+
     return parser
 
 
@@ -600,7 +648,16 @@ def _print_human(command: str, data: Dict[str, Any]) -> None:
         return
 
     if command == "repair":
-        print("Repaired '{}': removed locks {}.".format(data["profile"], data["locks_removed"]))
+        if data.get("profile") == "host":
+            print(
+                "Repaired Host Antigravity Hub: stopped PIDs {}, removed locks {}, relaunched={}.".format(
+                    data.get("signaled_pids") or [],
+                    data.get("locks_removed"),
+                    bool(data.get("relaunched")),
+                )
+            )
+        else:
+            print("Repaired '{}': removed locks {}.".format(data["profile"], data["locks_removed"]))
         return
 
     if command in ("delete", "rm"):
@@ -992,7 +1049,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     root = resolve_profiles_root(getattr(args, "root", None))
     cli_bin = os.path.realpath(sys.argv[0]) if sys.argv else None
     real_home_env = os.environ.get("AGY_PROFILES_REAL_HOME", "").strip()
-    real_home = Path(real_home_env).expanduser() if real_home_env else None
+    real_home = resolve_real_host_home(real_home_env or None, profiles_root=root)
     ctx = RuntimeContext(root=root, real_home=real_home, cli_bin_path=cli_bin)
 
     try:
@@ -1068,14 +1125,28 @@ def main(argv: Optional[List[str]] = None) -> int:
             else:
                 wd_s = s_res["watchdog"]
                 wb_s = s_res["web"]
+                gt = wd_s.get("guard_telemetry") or {}
                 print(
-                    "Watchdog daemon: loaded={} pid={} lock_pid={} caffeinate_idle_guard={}".format(
+                    "Watchdog daemon: loaded={} pid={} lock_pid={} caffeinate_idle_guard={} engine={}".format(
                         wd_s["launchd"]["loaded"],
                         wd_s["launchd"]["pid"],
                         wd_s["lock"]["pid"],
                         wd_s["caffeinate_idle_guard"],
+                        gt.get("engine") or "python-watchdog",
                     )
                 )
+                if gt:
+                    print(
+                        "Rust Guardian:   load={} vm_pressure={} pids={} gpu_rss={}MB paced={} reaped={} sweep={}us".format(
+                            gt.get("load_avg"),
+                            gt.get("vm_pressure_label"),
+                            gt.get("total_pids"),
+                            gt.get("gpu_window_rss_mb"),
+                            gt.get("total_reniced", 0),
+                            gt.get("total_reaped", 0),
+                            gt.get("sweep_duration_us", 0),
+                        )
+                    )
                 print(
                     "Web Console:     loaded={} pid={} listening={} origin={}".format(
                         wb_s["launchd"]["loaded"],
@@ -1085,6 +1156,56 @@ def main(argv: Optional[List[str]] = None) -> int:
                     )
                 )
                 print("Persistent Console URL: {}".format(wb_s["owner_url"]))
+            return 0
+
+        if cmd == "guard":
+            g_res = run_guard_once(ctx) if args.guard_action == "once" else (read_guard_telemetry(ctx) or run_guard_once(ctx))
+            if args.as_json:
+                print(json.dumps(g_res, indent=2))
+            else:
+                print(
+                    "Rust Guardian ({}): pids={}/{} load={} vm_pressure={} gpu_rss={}MB paced={} reaped={} sweep={}us".format(
+                        g_res.get("engine", "rust-agyp-guard"),
+                        g_res.get("user_pids", 0),
+                        g_res.get("total_pids", 0),
+                        g_res.get("load_avg"),
+                        g_res.get("vm_pressure_label"),
+                        g_res.get("gpu_window_rss_mb"),
+                        g_res.get("total_reniced", 0),
+                        g_res.get("total_reaped", 0),
+                        g_res.get("sweep_duration_us", 0),
+                    )
+                )
+                for ev in g_res.get("recent_events") or []:
+                    print("  event: {}".format(ev))
+            return 0
+
+        if cmd == "heal":
+            try:
+                call_tool("host_handoff", {"limit": 15, "source": "host"}, ctx)
+            except ToolError:
+                pass
+            h_res = heal_electron_compositor(
+                scope=args.scope,
+                target=args.target,
+                deep=bool(args.deep),
+                root=ctx.root,
+                real_home=ctx.real_home,
+            )
+            if args.as_json:
+                print(json.dumps(h_res, indent=2))
+            else:
+                print(
+                    "Healed Antigravity compositor (scope={}, target={}, deep={}): recycled_gpu={} recycled_renderers={} preserved_roots={} cleared_caches={}".format(
+                        h_res["scope"],
+                        h_res["target"],
+                        h_res["deep"],
+                        len(h_res["recycled_gpu_pids"]),
+                        len(h_res["recycled_renderer_pids"]),
+                        len(h_res["preserved_root_pids"]),
+                        len(h_res["cleared_shader_caches"]),
+                    )
+                )
             return 0
 
         if cmd == "watchdog":
@@ -1240,7 +1361,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 ctx,
             )
         elif cmd == "repair":
-            result = call_tool("profile_repair", {"name": args.name, "target": args.target}, ctx)
+            result = call_tool(
+                "profile_repair",
+                {
+                    "name": args.name,
+                    "target": args.target,
+                    "launch": not bool(getattr(args, "no_launch", False)),
+                },
+                ctx,
+            )
         elif cmd == "clone":
             result = call_tool(
                 "profile_clone",

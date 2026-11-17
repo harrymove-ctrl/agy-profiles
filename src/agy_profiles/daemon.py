@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 from pathlib import Path
 import plistlib
+import shlex
 import shutil
 import signal
 import socket
@@ -155,19 +157,106 @@ def _daemon_env(ctx: RuntimeContext) -> Dict[str, str]:
     }
 
 
+def _resolve_cargo_executable() -> Optional[str]:
+    home_cargo = str(Path.home() / ".cargo" / "bin" / "cargo")
+    for candidate in (
+        home_cargo,
+        "/opt/homebrew/bin/cargo",
+        "/usr/local/bin/cargo",
+        shutil.which("cargo") or "",
+    ):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def ensure_rust_guard_binary(ctx: RuntimeContext, dry_run: bool = False) -> Optional[Path]:
+    """Build or locate the zero-dependency native Rust agyp-guard binary for macOS CPU/GPU/PID protection."""
+    base_home = ctx.real_home or Path.home()
+    dst_bin = base_home / ".local" / "bin" / "agyp-guard"
+    repo_crate = Path(__file__).resolve().parents[2] / "rust" / "agyp-guard"
+    cargo_toml = repo_crate / "Cargo.toml"
+
+    if not _can_mutate_host_launchd(ctx, dry_run):
+        return dst_bin if (dst_bin.is_file() and os.access(str(dst_bin), os.X_OK)) else None
+
+    needs_build = not (dst_bin.is_file() and os.access(str(dst_bin), os.X_OK))
+    if not needs_build and cargo_toml.is_file():
+        try:
+            dst_mtime = dst_bin.stat().st_mtime
+            for src_file in [cargo_toml] + list((repo_crate / "src").glob("*.rs")):
+                if src_file.stat().st_mtime > dst_mtime:
+                    needs_build = True
+                    break
+        except OSError:
+            needs_build = True
+
+    if needs_build and cargo_toml.is_file():
+        cargo_exe = _resolve_cargo_executable()
+        if cargo_exe:
+            target_dir = (
+                Path("/Volumes/Dev/.cargo-target-agyp")
+                if Path("/Volumes/Dev").is_dir() and os.access("/Volumes/Dev", os.W_OK)
+                else (repo_crate / "target")
+            )
+            env = os.environ.copy()
+            env["CARGO_TARGET_DIR"] = str(target_dir)
+            proc = subprocess.run(
+                [cargo_exe, "build", "--release", "--manifest-path", str(cargo_toml)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            built_bin = target_dir / "release" / "agyp-guard"
+            if proc.returncode == 0 and built_bin.is_file():
+                dst_bin.parent.mkdir(parents=True, exist_ok=True)
+                tmp_dst = dst_bin.parent / ".agyp-guard.tmp"
+                shutil.copy2(str(built_bin), str(tmp_dst))
+                os.chmod(str(tmp_dst), 0o755)
+                if os.path.isfile("/usr/bin/codesign"):
+                    subprocess.run(
+                        ["/usr/bin/codesign", "--force", "--sign", "-", str(tmp_dst)],
+                        capture_output=True,
+                        timeout=10,
+                        check=False,
+                    )
+                os.replace(str(tmp_dst), str(dst_bin))
+
+    if dst_bin.is_file() and os.access(str(dst_bin), os.X_OK):
+        return dst_bin
+    return None
+
+
 def build_watchdog_plist_dict(
     ctx: RuntimeContext,
-    interval_sec: float = 5.0,
+    interval_sec: float = 3.0,
     prevent_sleep: bool = True,
+    guard_bin: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """Construct launchd plist dictionary for the 24/7 quota failover watchdog."""
+    """Construct launchd plist dictionary preferring native Rust agyp-guard over Python polling."""
     py_exe = _resolve_python_executable()
     agyp_bin = str(_resolve_agyp_entrypoint(ctx))
     logs_dir = _logs_dir(ctx)
     cmd: List[str] = []
     if prevent_sleep and os.path.isfile("/usr/bin/caffeinate"):
         cmd.extend(["/usr/bin/caffeinate", "-i"])
-    cmd.extend([py_exe, agyp_bin, "watchdog", "--interval", "{:.1f}".format(max(1.0, float(interval_sec)))])
+    if guard_bin is not None and guard_bin.is_file():
+        cmd.extend(
+            [
+                str(guard_bin),
+                "daemon",
+                "--root",
+                str(ctx.root),
+                "--agyp",
+                agyp_bin,
+                "--interval",
+                "{:.1f}".format(max(1.0, float(interval_sec))),
+            ]
+        )
+    else:
+        cmd.extend([py_exe, agyp_bin, "watchdog", "--interval", "{:.1f}".format(max(1.0, float(interval_sec)))])
     return {
         "Label": WATCHDOG_LABEL,
         "ProgramArguments": cmd,
@@ -257,10 +346,15 @@ def _stop_stray_daemons(port: int) -> List[int]:
         cmdline = parts[1]
         if "--sidecar" in cmdline or " mcp" in cmdline or " daemon" in cmdline:
             continue
-        is_agyp = ("agyp" in cmdline) or ("agy-profiles" in cmdline) or ("agy_profiles" in cmdline)
+        is_agyp = (
+            ("agyp" in cmdline)
+            or ("agy-profiles" in cmdline)
+            or ("agy_profiles" in cmdline)
+            or ("agyp-guard" in cmdline)
+        )
         if not is_agyp:
             continue
-        is_wd = " watchdog" in cmdline
+        is_wd = (" watchdog" in cmdline) or ("agyp-guard" in cmdline)
         is_web = (" web" in cmdline) and (port_flag in cmdline or "--port=" + str(port) in cmdline)
         if is_wd or is_web:
             try:
@@ -347,7 +441,9 @@ def _caffeinate_active() -> bool:
             check=False,
         )
         for line in proc.stdout.splitlines():
-            if "/usr/bin/caffeinate" in line and ("agyp" in line or "agy-profiles" in line):
+            if "/usr/bin/caffeinate" in line and (
+                "agyp" in line or "agy-profiles" in line or "agyp-guard" in line
+            ):
                 return True
     except (OSError, subprocess.SubprocessError):
         pass
@@ -363,16 +459,101 @@ def get_owner_console_url(ctx: RuntimeContext, host: str = "127.0.0.1", port: in
     return "{}/?token={}".format(origin, owner_token)
 
 
+def read_guard_telemetry(ctx: RuntimeContext) -> Optional[Dict[str, Any]]:
+    """Read the latest atomic .guard-telemetry.json snapshot written by Rust agyp-guard."""
+    tele_path = ctx.root / ".guard-telemetry.json"
+    if not tele_path.is_file():
+        return None
+    try:
+        parsed = json.loads(tele_path.read_text(encoding="utf-8"))
+        return parsed if isinstance(parsed, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def run_guard_once(ctx: RuntimeContext) -> Dict[str, Any]:
+    """Execute a single immediate Rust CPU/GPU/PID sweep via agyp-guard once --json."""
+    guard_bin = ensure_rust_guard_binary(ctx, dry_run=False)
+    if guard_bin is None:
+        raise ToolError(
+            "guard_unavailable",
+            "Native Rust agyp-guard binary is not built or cargo is unavailable.",
+            "Install Rust toolchain or run 'agyp daemon install' on macOS.",
+            http_status=503,
+        )
+    agyp_bin = str(_resolve_agyp_entrypoint(ctx))
+    proc = subprocess.run(
+        [str(guard_bin), "once", "--root", str(ctx.root), "--agyp", agyp_bin, "--json"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise ToolError(
+            "guard_failed",
+            "agyp-guard exited with status {}: {}".format(proc.returncode, (proc.stderr or proc.stdout).strip()),
+            http_status=500,
+        )
+    return json.loads(proc.stdout)
+
+
+def _ensure_spotlight_heal_app(ctx: RuntimeContext, dry_run: bool = False) -> Optional[str]:
+    """Compile ~/Applications/Heal Antigravity Screen.app so Cmd+Space fixes black windows without Cmd+Q."""
+    base_home = ctx.real_home or Path.home()
+    app_path = base_home / "Applications" / "Heal Antigravity Screen.app"
+    if not _can_mutate_host_launchd(ctx, dry_run):
+        return str(app_path) if app_path.is_dir() else None
+    osacompile_bin = shutil.which("osacompile") or "/usr/bin/osacompile"
+    if not os.path.isfile(osacompile_bin):
+        return None
+    agyp_bin = str(_resolve_agyp_entrypoint(ctx))
+    shell_cmd = "{} --root {} heal all --target all >/dev/null 2>&1 &".format(
+        shlex.quote(agyp_bin),
+        shlex.quote(str(ctx.root)),
+    )
+    escaped = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
+    apple_script = 'do shell script "{}"\n'.format(escaped)
+    try:
+        app_path.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(
+            [osacompile_bin, "-o", str(app_path), "-e", apple_script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        info_plist = app_path / "Contents" / "Info.plist"
+        if info_plist.is_file():
+            plist_data = plistlib.loads(info_plist.read_bytes())
+            plist_data["LSUIElement"] = True
+            plist_data["CFBundleIdentifier"] = "dev.agy-profiles.heal-screen"
+            plist_data["CFBundleName"] = "Heal Antigravity Screen"
+            info_plist.write_bytes(plistlib.dumps(plist_data))
+        if os.path.isfile("/usr/bin/codesign"):
+            subprocess.run(
+                ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(app_path)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        return str(app_path)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def install_daemons(
     ctx: RuntimeContext,
     host: str = "127.0.0.1",
     port: int = 47920,
-    interval_sec: float = 5.0,
+    interval_sec: float = 3.0,
     prevent_sleep: bool = True,
     open_browser: bool = True,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Write launchd LaunchAgents, activate 24/7 watchdog + web console, and optionally open browser."""
+    """Write launchd LaunchAgents, activate 24/7 Rust guardian + web console, and optionally open browser."""
     clean_host = validate_bind_host(host)
     clean_port = validate_port_number(port)
     agents_dir = _launch_agents_dir(ctx)
@@ -383,9 +564,15 @@ def install_daemons(
     os.chmod(str(logs_dir), 0o700)
     agents_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-initialize persistent web secrets before starting the web service so owner_token matches on boot.
+    guard_bin = ensure_rust_guard_binary(ctx, dry_run=dry_run)
+    heal_app = _ensure_spotlight_heal_app(ctx, dry_run=dry_run)
     owner_url = get_owner_console_url(ctx, host=clean_host, port=clean_port)
-    wd_plist = build_watchdog_plist_dict(ctx, interval_sec=interval_sec, prevent_sleep=prevent_sleep)
+    wd_plist = build_watchdog_plist_dict(
+        ctx,
+        interval_sec=interval_sec,
+        prevent_sleep=prevent_sleep,
+        guard_bin=guard_bin,
+    )
     web_plist = build_web_plist_dict(ctx, host=clean_host, port=clean_port)
 
     wd_plist_path = agents_dir / "{}.plist".format(WATCHDOG_LABEL)
@@ -412,7 +599,7 @@ def install_daemons(
         stopped_strays = _stop_stray_daemons(clean_port)
         launchctl_results.append(_launchctl_reload(wd_plist_path, WATCHDOG_LABEL))
         launchctl_results.append(_launchctl_reload(web_plist_path, WEB_LABEL))
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + 12.0
         while time.monotonic() < deadline:
             if _is_tcp_listening(clean_host, clean_port):
                 web_listening = True
@@ -434,6 +621,9 @@ def install_daemons(
     return {
         "installed": True,
         "dry_run": bool(dry_run),
+        "watchdog_engine": "rust-agyp-guard" if guard_bin is not None else "python-watchdog",
+        "rust_guard_bin": str(guard_bin) if guard_bin is not None else None,
+        "heal_spotlight_app": heal_app,
         "watchdog_plist": str(wd_plist_path),
         "web_plist": str(web_plist_path),
         "prevent_idle_sleep": bool(prevent_sleep),
@@ -451,7 +641,7 @@ def daemon_status(
     host: str = "127.0.0.1",
     port: int = 47920,
 ) -> Dict[str, Any]:
-    """Return live health of launchd watchdog, caffeinate assertion, and loopback Web Console."""
+    """Return live health of launchd Rust guardian, caffeinate assertion, and loopback Web Console."""
     clean_host = validate_bind_host(host)
     clean_port = validate_port_number(port)
     agents_dir = _launch_agents_dir(ctx)
@@ -462,6 +652,7 @@ def daemon_status(
     wd_lock = is_watchdog_locked(ctx.root)
     listening = _is_tcp_listening(clean_host, clean_port)
     owner_url = get_owner_console_url(ctx, host=clean_host, port=clean_port)
+    guard_tele = read_guard_telemetry(ctx)
     return {
         "watchdog": {
             "label": WATCHDOG_LABEL,
@@ -470,6 +661,7 @@ def daemon_status(
             "launchd": wd_info,
             "lock": wd_lock,
             "caffeinate_idle_guard": _caffeinate_active(),
+            "guard_telemetry": guard_tele,
         },
         "web": {
             "label": WEB_LABEL,

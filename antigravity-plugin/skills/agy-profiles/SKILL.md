@@ -37,9 +37,11 @@ Use this skill when isolating Google Antigravity workspaces, debugging stale Chr
 6. Stop cleanly or repair stale locks when finished:
    `agy-profiles stop work-backup --target all --json`
    `agy-profiles repair work-backup --json`
-7. Keep the 24/7 macOS `launchd` services (`watchdog` wrapped in `/usr/bin/caffeinate -i` plus the persistent Web Console on `127.0.0.1:47920`) active across overnight or multi-day unattended runs:
+7. Keep the 24/7 macOS `launchd` services (`agyp-guard` native Rust CPU/GPU/PID guardian wrapped in `/usr/bin/caffeinate -i` plus the persistent Web Console on `127.0.0.1:47920`) active across overnight or multi-day unattended runs:
    `agyp daemon install --json`
    `agyp daemon status --json`
+   `agyp guard once --json`
+   `agyp heal all --json`
    `agyp daemon open`
 
 ## Safety Invariants Enforced Automatically

@@ -90,6 +90,50 @@ export function getCsrfToken(): string {
   return meta?.getAttribute("content") ?? "";
 }
 
+let csrfRefreshPromise: Promise<string> | null = null;
+
+async function refreshCsrfTokenFromSameOrigin(): Promise<string> {
+  if (typeof window === "undefined" || typeof DOMParser === "undefined") {
+    return "";
+  }
+  if (csrfRefreshPromise) {
+    return csrfRefreshPromise;
+  }
+  csrfRefreshPromise = (async () => {
+    try {
+      const rootQuery =
+        IS_EMBEDDED_SIDECAR && INITIAL_BOOT_TOKEN
+          ? `/?token=${encodeURIComponent(INITIAL_BOOT_TOKEN)}`
+          : "/";
+      const res = await fetch(rootQuery, {
+        method: "GET",
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        return "";
+      }
+      const html = await res.text();
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const freshToken =
+        doc.querySelector('meta[name="agy-csrf"]')?.getAttribute("content")?.trim() ?? "";
+      if (freshToken && freshToken !== "__AGY_CSRF_TOKEN__") {
+        const liveMeta = document.querySelector('meta[name="agy-csrf"]');
+        if (liveMeta) {
+          liveMeta.setAttribute("content", freshToken);
+        }
+        return freshToken;
+      }
+      return "";
+    } catch {
+      return "";
+    } finally {
+      csrfRefreshPromise = null;
+    }
+  })();
+  return csrfRefreshPromise;
+}
+
 export class ApiClientError extends Error {
   code: string;
   remediation: string;
@@ -106,7 +150,8 @@ export class ApiClientError extends Error {
 
 export async function apiFetch<T>(
   path: string,
-  options?: { method?: string; body?: object }
+  options?: { method?: string; body?: object },
+  retriedCsrf = false
 ): Promise<T> {
   const method = options?.method ?? "GET";
   const headers: Record<string, string> = {
@@ -151,6 +196,13 @@ export async function apiFetch<T>(
       typeof data === "object" && data !== null && "error" in data
         ? (data as { error?: { message?: string; code?: string; remediation?: string } }).error
         : undefined;
+    if (!retriedCsrf && res.status === 403 && errObj?.code === "csrf_rejected") {
+      const prevToken = headers["X-AGY-CSRF"];
+      const refreshedToken = await refreshCsrfTokenFromSameOrigin();
+      if (refreshedToken && refreshedToken !== prevToken) {
+        return apiFetch<T>(path, options, true);
+      }
+    }
     throw new ApiClientError(
       errObj?.message || `Request failed (${res.status})`,
       errObj?.code || "request_failed",

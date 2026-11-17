@@ -30,9 +30,11 @@ export interface TopBarProps {
   themeSlug: ThemeSlug;
   isDarkOnlyTheme: boolean;
   resolvedMode: "light" | "dark";
+  healBusy?: boolean;
   onViewChange: (view: AppView) => void;
   onThemeChange: (slug: ThemeSlug) => void;
   onToggleColorMode: () => void;
+  onHealScreen: () => void;
   onOpenCreate: () => void;
 }
 
@@ -47,9 +49,11 @@ export function TopBar({
   themeSlug,
   isDarkOnlyTheme,
   resolvedMode,
+  healBusy = false,
   onViewChange,
   onThemeChange,
   onToggleColorMode,
+  onHealScreen,
   onOpenCreate,
 }: TopBarProps) {
   const isWide = useMediaQuery("(min-width: 1180px)");
@@ -132,6 +136,14 @@ export function TopBar({
               onClick={onToggleColorMode}
             />
           ) : null}
+          <Button
+            size="sm"
+            variant="secondary"
+            label={healBusy ? "Healing..." : "Heal Screen"}
+            tooltip="Recover black Antigravity windows without Cmd+Q by recycling GPU compositors"
+            isDisabled={healBusy}
+            onClick={onHealScreen}
+          />
           <Button
             size="sm"
             variant="primary"

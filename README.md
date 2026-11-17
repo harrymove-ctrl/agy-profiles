@@ -145,7 +145,9 @@ This updates `src/agy_profiles/web_static/` directly for packaging and verificat
 | `agy-profiles obligations [--json]` | Execute and report all six live security obligation checks. |
 | `agy-profiles mcp` | Serve 17 tools over line-delimited JSON-RPC 2.0 stdio. |
 | `agy-profiles web [--host 127.0.0.1] [--port 47920] [--sidecar]` | Start the CSRF-guarded local web console or Antigravity Aux Pane sidecar service. |
-| `agyp daemon [install\|status\|open\|restart\|uninstall]` | Install and manage persistent 24/7 macOS `launchd` services (`watchdog` wrapped in `caffeinate -i` plus the loopback Web Console). |
+| `agyp daemon [install\|status\|open\|restart\|uninstall]` | Install and manage persistent 24/7 macOS `launchd` services (`agyp-guard` Rust guardian wrapped in `caffeinate -i` plus the loopback Web Console). |
+| `agyp guard [status\|once] [--json]` | Inspect or run the zero-dependency native Rust CPU, GPU, unified memory, and orphan PID guardian (`rust/agyp-guard`). |
+| `agyp heal [all\|host\|<name>] [--target hub\|ide\|all] [--deep]` | Recover black Antigravity windows without `Cmd+Q` by purging Metal/Dawn shader caches and recycling `--type=gpu-process` while keeping all running sessions and `language_server` alive. |
 | `agyp watchdog [--interval 5] [--once]` | Poll active logs and automatically switch quota, clickable sessions, and Automations onto the standby profile on exhaustion. |
 | `agyp auto` / `agyp agy <name>` | Run terminal `agy` CLI with Turbo permissions, Antigravity Mobile remote control, and mid-session automatic quota failover. |
 | `agy-profiles watch` / `agyp top` `[--theme sacred\|gothic\|catppuccin\|amber\|ascii] [--once] [--redact] [--export-svg <path>]` | Run the zero-dependency SRCL and WebTUI inspired ASCII terminal telemetry dashboard or export dark-mode SVG cards for X and GitHub. |

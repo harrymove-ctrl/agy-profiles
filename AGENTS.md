@@ -9,6 +9,7 @@ This workspace (`/Volumes/Dev/agy-profiles`) builds and maintains `agy-profiles`
 3. **Never-Crash Bounds and Fail-Closed Defaults**: All validation failures must raise `ToolError` with clear remediation text. Never fall back to copying unredacted files when JSON parsing fails, never bind `web_server.py` beyond `127.0.0.1` or `::1`, and never follow symlinks outside the active profile root.
 4. **Strict CSP and XSS-Safe Web UI**: Keep `web-ui/` compiled cleanly into `src/agy_profiles/web_static/` (`index.html`, `styles.css`, `app.js`, `mark.svg`, `fonts/*.woff2`) with zero external CDNs (`fonts.googleapis.com` forbidden), zero emojis, zero `dangerouslySetInnerHTML`, and React auto-escaped rendering for all untrusted backend values. Maintain `script-src 'self'` and `font-src 'self'` alongside `style-src 'self' 'unsafe-inline'` required by the Astryx runtime theme layer.
 5. **Clean-Room Prose and Hygiene**: Write all documentation, UI copy, comments, and commit messages in 100% English without em-dashes, en-dashes, spaced hyphens, horizontal rules, or unordered dash bullets. Run `python3 scripts/check_secrets.py` before committing.
+6. **Never Disable Host Automations**: Never write `"enabled": false` into Host `~/.gemini/config/config.json` during `sync`, `switch`, or `watchdog` failover, and ignore single-model `Individual quota reached` rate limits so Host scheduled Automations always stay enabled.
 
 ## Verification Gates Before Committing
 

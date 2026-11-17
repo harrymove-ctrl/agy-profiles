@@ -16,3 +16,4 @@ web-ui/.astryx/
 web-ui/themes/**/*.html
 web-ui/themes/**/*.png
 web-ui/themes/**/*.pictures.json
+rust/agyp-guard/target/

@@ -70,10 +70,12 @@ from agy_profiles.process_guard import (
     DATA_SUBDIR_BY_TARGET,
     LOCK_FILENAMES,
     command_matches_user_data_dir,
+    inspect_host_hub_tls_health,
     inspect_host_runtime,
     inspect_locks,
     launch_profile,
     list_all_processes,
+    repair_host_hub,
     repair_locks,
     stop_profile,
 )
@@ -680,7 +682,11 @@ def _handle_profile_stop(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[st
 
 
 def _handle_profile_repair(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
-    name = validate_profile_name(str(params.get("name") or ""))
+    raw_name = str(params.get("name") or "").strip()
+    if raw_name.lower() == "host":
+        do_launch = bool(params.get("launch", True))
+        return repair_host_hub(real_home=ctx.real_home, launch=do_launch)
+    name = validate_profile_name(raw_name)
     profile_dir, manifest = load_manifest(ctx.root, name)
     target = params.get("target")
     locks = repair_locks(
@@ -1190,6 +1196,12 @@ def _handle_switch_to_host(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[
     )
     host_restored = restore_host_automations(real_home=ctx.real_home)
 
+    host_repair_res: Optional[Dict[str, Any]] = None
+    host_hub_rt = inspect_host_runtime(real_home=ctx.real_home).get("hub", {})
+    host_tls = inspect_host_hub_tls_health(real_home=ctx.real_home, host_hub_runtime=host_hub_rt)
+    if launch and (host_hub_rt.get("state") != "running" or host_tls.get("tls_broken")):
+        host_repair_res = repair_host_hub(real_home=ctx.real_home, launch=True)
+
     if launch and running_targets:
         for tgt in running_targets:
             relaunch_results.append(
@@ -1248,6 +1260,7 @@ def _handle_switch_to_host(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[
             "prompt_copied": prompt_copied,
             "resume_prompt": prompt_text,
             "relaunched_backup": relaunch_results,
+            "host_repaired": host_repair_res,
             "host_automations_restored": host_restored,
         },
         "evidence": ev.to_dict(),
@@ -1442,6 +1455,11 @@ def _handle_system_doctor(ctx: RuntimeContext, _params: Dict[str, Any]) -> Dict[
             "id": "isolation_audit",
             "status": "fail" if insecure_profiles else "pass",
             "detail": ", ".join(insecure_profiles) if insecure_profiles else "All provisioned profiles pass isolation checks",
+        },
+        {
+            "id": "host_hub_tls",
+            "status": "warn" if inspect_host_hub_tls_health(real_home=ctx.real_home).get("tls_broken") else "pass",
+            "detail": str(inspect_host_hub_tls_health(real_home=ctx.real_home).get("detail") or "Host Hub localhost TLS pipe healthy"),
         },
     ]
     ev = EvidenceRecord(
@@ -1830,6 +1848,7 @@ TOOL_SPECS: List[ToolSpec] = [
             "properties": {
                 "name": {"type": "string"},
                 "target": {"type": "string", "enum": ["hub", "ide"]},
+                "launch": {"type": "boolean", "default": True},
             },
             "required": ["name"],
             "additionalProperties": False,

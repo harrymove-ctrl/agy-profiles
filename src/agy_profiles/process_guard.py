@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+try:
+    import pwd
+except ImportError:  # pragma: no cover
+    pwd = None  # type: ignore[assignment]
 import re
 import signal
 import subprocess
+import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -192,6 +197,15 @@ def inspect_locks(
     }
 
 
+def _passwd_home_dir() -> Optional[Path]:
+    if pwd is None:
+        return None
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    except (KeyError, OSError):
+        return None
+
+
 def inspect_host_runtime(
     real_home: Optional[Path] = None,
     targets: Optional[Dict[str, TargetInfo]] = None,
@@ -200,10 +214,15 @@ def inspect_host_runtime(
 ) -> Dict[str, Dict[str, Any]]:
     """Inspect live runtime state and cron runners for primary Host Antigravity targets."""
     host_home = (real_home if real_home is not None else Path.home()).resolve()
+    pw_home = _passwd_home_dir()
     effective_allow_no_flag = (
         bool(allow_default_no_flag)
         if allow_default_no_flag is not None
-        else (real_home is None or host_home == Path.home().resolve())
+        else (
+            real_home is None
+            or host_home == Path.home().resolve()
+            or (pw_home is not None and host_home == pw_home)
+        )
     )
     target_map = targets if targets is not None else detect_targets()
     rows = ps_rows if ps_rows is not None else list_all_processes()
@@ -520,4 +539,279 @@ def stop_profile(
         "stopped": targets,
         "signaled_pids": signaled_pids,
         "forced_pids": forced_pids,
+    }
+
+
+def inspect_host_hub_tls_health(
+    real_home: Optional[Path] = None,
+    host_hub_runtime: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Detect whether Host Antigravity Hub hit ERR_CERT_AUTHORITY_INVALID after a NetworkService restart."""
+    host_home = (real_home if real_home is not None else Path.home()).resolve()
+    hub_rt = (
+        host_hub_runtime
+        if host_hub_runtime is not None
+        else inspect_host_runtime(real_home=host_home).get("hub", {})
+    )
+    running = hub_rt.get("state") == "running"
+    main_log = host_home / "Library" / "Logs" / "Antigravity" / "main.log"
+    tls_broken = False
+    detail = "Host Hub localhost TLS pipe healthy"
+
+    if main_log.is_file() and not main_log.is_symlink():
+        try:
+            size = int(main_log.stat().st_size)
+            read_from = max(0, size - 65536)
+            with main_log.open("rb") as fh:
+                fh.seek(read_from)
+                tail_text = fh.read(size - read_from).decode("utf-8", errors="replace")
+            last_start = tail_text.rfind("Starting app (")
+            active_segment = tail_text[last_start:] if last_start >= 0 else tail_text
+            if "ERR_CERT_AUTHORITY_INVALID" in active_segment and "Shutting down language server" not in active_segment[active_segment.rfind("ERR_CERT_AUTHORITY_INVALID"):]:
+                tls_broken = True
+                detail = (
+                    "Host Hub logged ERR_CERT_AUTHORITY_INVALID after NetworkService restart; "
+                    "run 'agy-profiles repair host' to restore Language Server TLS trust"
+                )
+        except OSError:
+            pass
+
+    return {
+        "running": running,
+        "tls_broken": tls_broken,
+        "detail": detail,
+    }
+
+
+def repair_host_hub(
+    real_home: Optional[Path] = None,
+    launch: bool = True,
+    timeout_sec: float = 5.0,
+    targets_override: Optional[Dict[str, TargetInfo]] = None,
+) -> Dict[str, Any]:
+    """Stop broken Host Antigravity Hub PIDs, clear stale Host locks, and relaunch with open -n."""
+    host_home = (real_home if real_home is not None else Path.home()).resolve()
+    targets = targets_override if targets_override is not None else detect_targets()
+    hub_info = targets.get("hub")
+
+    rt_before = inspect_host_runtime(real_home=host_home, targets=targets)
+    hub_pids = list(rt_before.get("hub", {}).get("pids") or [])
+    signaled_pids: List[int] = []
+    forced_pids: List[int] = []
+
+    # Signal children before the root Electron PID so language_server exits cleanly.
+    for pid in reversed(hub_pids):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            signaled_pids.append(pid)
+        except ProcessLookupError:
+            pass
+
+    deadline = time.monotonic() + max(0.2, float(timeout_sec))
+    remaining = list(hub_pids)
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.2)
+        fresh_pids = set(inspect_host_runtime(real_home=host_home, targets=targets).get("hub", {}).get("pids") or [])
+        remaining = [pid for pid in remaining if pid in fresh_pids and _pid_is_alive(pid)]
+
+    if remaining:
+        fresh_pids = set(inspect_host_runtime(real_home=host_home, targets=targets).get("hub", {}).get("pids") or [])
+        for pid in remaining:
+            if pid in fresh_pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    forced_pids.append(pid)
+                except ProcessLookupError:
+                    pass
+        time.sleep(0.2)
+
+    host_data_dir = host_home / HOST_DATA_DIR_RELPATHS["hub"]
+    removed_locks: List[str] = []
+    if host_data_dir.is_dir() and not host_data_dir.is_symlink():
+        for fname in LOCK_FILENAMES:
+            lock_slot = host_data_dir / fname
+            if lock_slot.exists() or lock_slot.is_symlink():
+                try:
+                    lock_slot.unlink()
+                    removed_locks.append(fname)
+                except OSError:
+                    pass
+
+    launched = False
+    if launch:
+        if hub_info is None or not hub_info.installed or not hub_info.app_path:
+            raise ToolError(
+                "target_not_found",
+                "Host Antigravity.app is not installed in /Applications.",
+                "Install Antigravity.app in /Applications and retry.",
+            )
+        clean_env: Dict[str, str] = {
+            "HOME": str(host_home),
+            "USER": os.environ.get("USER") or host_home.name,
+            "LOGNAME": os.environ.get("LOGNAME") or host_home.name,
+            "SHELL": os.environ.get("SHELL") or "/bin/zsh",
+            "TMPDIR": os.environ.get("TMPDIR") or "/tmp",
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        }
+        if sys.platform == "darwin" and Path("/usr/bin/open").exists():
+            proc = subprocess.run(
+                ["/usr/bin/open", "-n", "-a", hub_info.app_path],
+                env=clean_env,
+                cwd=str(host_home),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise ToolError(
+                    "process_error",
+                    "Failed to relaunch Host Antigravity.app: {}.".format((proc.stderr or proc.stdout).strip()),
+                    "Open /Applications/Antigravity.app manually or inspect macOS LaunchServices.",
+                )
+            launched = True
+        elif hub_info.binary_path:
+            subprocess.Popen(
+                [hub_info.binary_path],
+                env=clean_env,
+                cwd=str(host_home),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            launched = True
+
+    return {
+        "profile": "host",
+        "locks_removed": {"hub": removed_locks, "ide": []},
+        "signaled_pids": signaled_pids,
+        "forced_pids": forced_pids,
+        "relaunched": launched,
+    }
+
+
+GPU_SHADER_CACHE_DIRS: Tuple[str, ...] = (
+    "GPUCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+    "GraphiteDawnCache",
+)
+
+
+def _purge_gpu_shader_caches(data_dir: Path) -> List[str]:
+    """Delete only Metal/WebGPU shader caches inside data_dir while keeping sessions, DBs, and OAuth intact."""
+    cleared: List[str] = []
+    if not data_dir.is_dir():
+        return cleared
+    candidates: List[Path] = []
+    for cache_name in GPU_SHADER_CACHE_DIRS:
+        candidates.append(data_dir / cache_name)
+        candidates.append(data_dir / "Default" / cache_name)
+    for cdir in candidates:
+        if not cdir.is_dir() or cdir.is_symlink():
+            continue
+        removed_any = False
+        try:
+            for child in cdir.iterdir():
+                if child.is_symlink() or child.is_file():
+                    child.unlink()
+                    removed_any = True
+        except OSError:
+            pass
+        if removed_any:
+            cleared.append(str(cdir))
+    return cleared
+
+
+def heal_electron_compositor(
+    scope: str = "all",
+    target: str = "all",
+    deep: bool = False,
+    root: Optional[Path] = None,
+    real_home: Optional[Path] = None,
+    ps_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Recover black Antigravity windows without Cmd+Q by purging GPU shader caches and recycling --type=gpu-process."""
+    if target == "all":
+        targets: Tuple[str, ...] = ("hub", "ide")
+    else:
+        targets = (validate_target(target),)
+
+    base_home = (real_home if real_home is not None else Path.home()).expanduser()
+    detected = detect_targets()
+    rows = ps_rows if ps_rows is not None else list_all_processes()
+
+    data_dirs_to_heal: List[Tuple[str, str, Path]] = []
+    if scope in ("host", "all"):
+        for tgt in targets:
+            data_dirs_to_heal.append(("host", tgt, base_home / HOST_DATA_DIR_RELPATHS[tgt]))
+
+    if scope != "host" and root is not None and root.is_dir():
+        if scope == "all":
+            for child in sorted(root.iterdir()):
+                if child.is_dir() and not child.name.startswith(".") and (child / "profile.json").is_file():
+                    for tgt in targets:
+                        data_dirs_to_heal.append((child.name, tgt, child / DATA_SUBDIR_BY_TARGET[tgt]))
+        else:
+            prof_dir = ensure_within_root(root, root / scope)
+            for tgt in targets:
+                data_dirs_to_heal.append((scope, tgt, prof_dir / DATA_SUBDIR_BY_TARGET[tgt]))
+
+    cleared_caches: List[str] = []
+    recycled_gpu_pids: List[int] = []
+    recycled_renderer_pids: List[int] = []
+    preserved_roots: List[int] = []
+
+    for owner_name, tgt, data_dir in data_dirs_to_heal:
+        cleared_caches.extend(_purge_gpu_shader_caches(data_dir))
+        resolved_dir = str(data_dir.resolve()) if data_dir.exists() else str(data_dir)
+        tinfo: Optional[TargetInfo] = detected.get(tgt)
+        bin_path = tinfo.binary_path if (tinfo and tinfo.installed) else ""
+
+        seed_pids: Set[int] = set()
+        for row in rows:
+            cmd = str(row.get("command", ""))
+            pid = int(row["pid"])
+            if owner_name == "host":
+                if command_matches_host_target(cmd, bin_path, data_dir) or command_matches_user_data_dir(cmd, resolved_dir):
+                    seed_pids.add(pid)
+            else:
+                if command_matches_user_data_dir(cmd, resolved_dir):
+                    seed_pids.add(pid)
+
+        tree = _expand_process_tree(rows, seed_pids)
+        for row in tree:
+            pid = int(row["pid"])
+            cmd = str(row.get("command", ""))
+            if not _PROCESS_TYPE_RE.search(cmd):
+                if "language_server" not in cmd and pid not in preserved_roots:
+                    preserved_roots.append(pid)
+                continue
+            if "--type=gpu-process" in cmd and pid not in recycled_gpu_pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    recycled_gpu_pids.append(pid)
+                except ProcessLookupError:
+                    pass
+            elif deep and "--type=renderer" in cmd and pid not in recycled_renderer_pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    recycled_renderer_pids.append(pid)
+                except ProcessLookupError:
+                    pass
+
+    if recycled_gpu_pids or recycled_renderer_pids:
+        time.sleep(0.35)
+
+    return {
+        "scope": scope,
+        "target": target,
+        "deep": bool(deep),
+        "recycled_gpu_pids": recycled_gpu_pids,
+        "recycled_renderer_pids": recycled_renderer_pids,
+        "preserved_root_pids": preserved_roots,
+        "cleared_shader_caches": cleared_caches,
+        "healed_at": utc_now_iso(),
     }

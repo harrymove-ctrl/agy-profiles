@@ -773,7 +773,25 @@ class McpAndCliTests(unittest.TestCase):
         self.assertTrue(wd1["initialized"])
         self.assertIsNone(wd1["switched_to"])
 
-        # 2. Simulate new Host quota exhaustion -> watchdog auto-switches, pauses Host cron-live, enables ONLY cron-live on backup
+        # 1b. Per-model 429 ("Individual quota reached") must NEVER false-trigger failover or pause Host automations
+        ls_log = self.fake_home / "Library" / "Logs" / "Antigravity" / "language_server.log"
+        ls_log.parent.mkdir(parents=True, exist_ok=True)
+        ls_log.write_text(
+            "E1117 10:43:21 errorreport.go:273] RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 97h.\n",
+            encoding="utf-8",
+        )
+        buf_noise = io.StringIO()
+        try:
+            sys.stdout = buf_noise
+            rc_noise = cli_main(["--root", str(self.root), "watchdog", "--once", "--no-launch", "--json"])
+        finally:
+            sys.stdout = old_stdout
+        self.assertEqual(rc_noise, 0)
+        wd_noise = json.loads(buf_noise.getvalue())
+        self.assertFalse(wd_noise["quota_exhausted_detected"])
+        self.assertIsNone(wd_noise["switched_to"])
+
+        # 2. Simulate account-wide credit depletion -> watchdog switches to backup, NEVER disables Host cron-live, and enables ONLY cron-live on backup
         with cli_log.open("a", encoding="utf-8") as fh:
             fh.write("E1116 server.go:900] request failed: INSUFFICIENT_G1_CREDITS_BALANCE\n")
 
@@ -787,9 +805,9 @@ class McpAndCliTests(unittest.TestCase):
         wd2 = json.loads(buf2.getvalue())
         self.assertEqual(wd2["switched_to"], "backup-auto")
 
-        host_cfg_paused = json.loads((host_gemini / "config" / "config.json").read_text(encoding="utf-8"))
-        self.assertFalse(host_cfg_paused["sidecars"]["cron-live"]["enabled"])
-        self.assertFalse(host_cfg_paused["sidecars"]["cron-disabled"]["enabled"])
+        host_cfg_preserved = json.loads((host_gemini / "config" / "config.json").read_text(encoding="utf-8"))
+        self.assertTrue(host_cfg_preserved["sidecars"]["cron-live"]["enabled"])
+        self.assertFalse(host_cfg_preserved["sidecars"]["cron-disabled"]["enabled"])
 
         backup_cfg_active = json.loads(
             (self.root / "backup-auto" / "home" / ".gemini" / "config" / "config.json").read_text(encoding="utf-8")
@@ -804,13 +822,13 @@ class McpAndCliTests(unittest.TestCase):
         )
         self.assertIn("command(*)", backup_sc["agent_permissions"]["access_grants"])
 
-        # 3. Return to Host restores ONLY cron-live on Host and pauses backup-auto
+        # 3. Return to Host keeps cron-live enabled on Host and pauses backup-auto
         returned = call_tool(
             "profile_switch",
             {"name": "host", "from_source": "backup-auto", "launch": False},
             self.ctx,
         )
-        self.assertEqual(returned["switch"]["host_automations_restored"]["restored_ids"], ["cron-live"])
+        self.assertTrue(returned["switch"]["host_automations_restored"]["host_automations_preserved"])
         host_cfg_restored = json.loads((host_gemini / "config" / "config.json").read_text(encoding="utf-8"))
         self.assertTrue(host_cfg_restored["sidecars"]["cron-live"]["enabled"])
         self.assertFalse(host_cfg_restored["sidecars"]["cron-disabled"]["enabled"])
@@ -858,6 +876,30 @@ class McpAndCliTests(unittest.TestCase):
         self.assertEqual(calls[1]["home"], str((self.root / "backup-auto" / "home").resolve()))
         self.assertIn("-c", calls[1]["args"])
         self.assertIn("--dangerously-skip-permissions", calls[1]["args"])
+
+    def test_host_hub_tls_doctor_and_repair_host(self) -> None:
+        host_app_support = self.fake_home / "Library" / "Application Support" / "Antigravity"
+        host_app_support.mkdir(parents=True, exist_ok=True)
+        stale_lock = host_app_support / "SingletonLock"
+        stale_lock.write_text("stale-host-lock", encoding="utf-8")
+
+        host_logs = self.fake_home / "Library" / "Logs" / "Antigravity"
+        host_logs.mkdir(parents=True, exist_ok=True)
+        (host_logs / "main.log").write_text(
+            "[2026-11-17 12:17:23.065] [info]  Starting app (v2.32.1) with dynamic port\n"
+            "[2026-11-17 12:33:15.100] [error] electron: Failed to load URL: https://127.0.0.1:57332/ "
+            "with error: ERR_CERT_AUTHORITY_INVALID\n",
+            encoding="utf-8",
+        )
+
+        repaired = call_tool(
+            "profile_repair",
+            {"name": "host", "launch": False},
+            self.ctx,
+        )
+        self.assertEqual(repaired["profile"], "host")
+        self.assertIn("SingletonLock", repaired["locks_removed"]["hub"])
+        self.assertFalse(stale_lock.exists())
 
     def test_bin_wrapper_execution(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
