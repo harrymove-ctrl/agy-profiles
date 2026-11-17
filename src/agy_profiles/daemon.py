@@ -119,6 +119,18 @@ def _launch_agents_dir(ctx: RuntimeContext) -> Path:
     return base_home / "Library" / "LaunchAgents"
 
 
+def _can_mutate_host_launchd(ctx: RuntimeContext, dry_run: bool) -> bool:
+    """Guard real macOS launchctl and PID cleanup so isolated fake-home tests never touch host services."""
+    if dry_run or sys.platform != "darwin":
+        return False
+    if ctx.real_home is None:
+        return True
+    try:
+        return Path(ctx.real_home).resolve() == Path.home().resolve()
+    except OSError:
+        return False
+
+
 def _logs_dir(ctx: RuntimeContext) -> Path:
     base_home = ctx.real_home or Path.home()
     return base_home / "Library" / "Logs" / "agy-profiles"
@@ -387,7 +399,7 @@ def install_daemons(
     launchctl_results: List[Dict[str, Any]] = []
     web_listening = False
 
-    if not dry_run and sys.platform == "darwin":
+    if _can_mutate_host_launchd(ctx, dry_run):
         domain = _launchctl_domain()
         for p_path in (wd_plist_path, web_plist_path):
             subprocess.run(
@@ -503,9 +515,10 @@ def uninstall_daemons(ctx: RuntimeContext, dry_run: bool = False) -> Dict[str, A
     agents_dir = _launch_agents_dir(ctx)
     removed: List[str] = []
     domain = _launchctl_domain()
+    mutate_host = _can_mutate_host_launchd(ctx, dry_run)
     for label in (WATCHDOG_LABEL, WEB_LABEL):
         plist_path = agents_dir / "{}.plist".format(label)
-        if not dry_run and sys.platform == "darwin" and plist_path.is_file():
+        if mutate_host and plist_path.is_file():
             subprocess.run(
                 ["/bin/launchctl", "bootout", domain, str(plist_path)],
                 capture_output=True,
@@ -517,7 +530,7 @@ def uninstall_daemons(ctx: RuntimeContext, dry_run: bool = False) -> Dict[str, A
             if not dry_run:
                 plist_path.unlink()
             removed.append(str(plist_path))
-    stopped_strays = _stop_stray_daemons(47920) if (not dry_run and sys.platform == "darwin") else []
+    stopped_strays = _stop_stray_daemons(47920) if mutate_host else []
     return {
         "uninstalled": True,
         "dry_run": bool(dry_run),
