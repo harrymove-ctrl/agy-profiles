@@ -945,7 +945,22 @@ def _run_agy_cli_command(
             )
         )
     sys.stderr.flush()
-    proc = subprocess.run(full_cmd, env=child_env, cwd=cwd_str, check=False)
+    try:
+        proc = subprocess.run(full_cmd, env=child_env, cwd=cwd_str, check=False)
+    except OSError as exc:
+        if sys.platform == "win32" and getattr(exc, "winerror", None) == 193:
+            first_line = ""
+            try:
+                with open(agy_bin, "r", encoding="utf-8", errors="replace") as fh:
+                    first_line = fh.readline()
+            except OSError:
+                pass
+            if first_line.startswith("#!") and "python" in first_line.lower():
+                proc = subprocess.run([sys.executable] + full_cmd, env=child_env, cwd=cwd_str, check=False)
+            else:
+                proc = subprocess.run(["cmd", "/c"] + full_cmd, env=child_env, cwd=cwd_str, check=False)
+        else:
+            raise
     return int(proc.returncode)
 
 

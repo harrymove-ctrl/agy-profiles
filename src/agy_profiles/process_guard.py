@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import json
 import os
 from pathlib import Path
 try:
@@ -33,10 +35,17 @@ DATA_SUBDIR_BY_TARGET: Dict[str, str] = {
     "ide": "ide-data",
 }
 
-HOST_DATA_DIR_RELPATHS: Dict[str, str] = {
-    "hub": "Library/Application Support/Antigravity",
-    "ide": "Library/Application Support/Antigravity IDE",
-}
+HOST_DATA_DIR_RELPATHS: Dict[str, str] = (
+    {
+        "hub": "AppData/Roaming/Antigravity",
+        "ide": "AppData/Roaming/Antigravity IDE",
+    }
+    if sys.platform == "win32"
+    else {
+        "hub": "Library/Application Support/Antigravity",
+        "ide": "Library/Application Support/Antigravity IDE",
+    }
+)
 
 LOCK_FILENAMES: Tuple[str, ...] = (
     "SingletonLock",
@@ -49,8 +58,50 @@ _PROCESS_TYPE_RE = re.compile(r"(?:^|\s)--type=")
 _USER_DATA_DIR_FLAG_RE = re.compile(r"(?:^|\s)--user-data-dir(?:=|\s)")
 
 
+def _list_all_processes_windows() -> List[Dict[str, Any]]:
+    ps_cmd = (
+        "Get-CimInstance Win32_Process | "
+        "Select-Object ProcessId,ParentProcessId,CommandLine | "
+        "ConvertTo-Json -Compress"
+    )
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=8,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    try:
+        parsed = json.loads(proc.stdout)
+    except ValueError:
+        return []
+    items = parsed if isinstance(parsed, list) else [parsed]
+    rows: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            pid = int(item.get("ProcessId"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            ppid = int(item.get("ParentProcessId") or 0)
+        except (TypeError, ValueError):
+            ppid = 0
+        cmd = str(item.get("CommandLine") or "")
+        rows.append({"pid": pid, "ppid": ppid, "pgid": 0, "command": cmd})
+    return rows
+
+
 def list_all_processes() -> List[Dict[str, Any]]:
     """Read host process table with closed stdin and bounded wall timeout."""
+    if sys.platform == "win32":
+        return _list_all_processes_windows()
     proc = subprocess.run(
         ["/bin/ps", "-axo", "pid=,ppid=,pgid=,command="],
         stdin=subprocess.DEVNULL,
@@ -85,6 +136,9 @@ def command_matches_user_data_dir(command: str, resolved_data_dir: str) -> bool:
     """Strictly verify --user-data-dir=<exact_path> token boundary in command line."""
     if not resolved_data_dir:
         return False
+    if sys.platform == "win32":
+        pattern = r'(?:^|\s)--user-data-dir="?' + re.escape(resolved_data_dir) + r'"?(?:\s|$)'
+        return bool(re.search(pattern, command, re.IGNORECASE))
     pattern = r"(?:^|\s)--user-data-dir=" + re.escape(resolved_data_dir) + r"(?:\s|$)"
     return bool(re.search(pattern, command))
 
@@ -396,20 +450,27 @@ def launch_profile(
     env["XDG_CONFIG_HOME"] = str(sandbox_home / ".config")
     env["XDG_DATA_HOME"] = str(sandbox_home / ".local" / "share")
     env["XDG_CACHE_HOME"] = str(sandbox_home / ".cache")
+    if sys.platform == "win32":
+        win_roaming = sandbox_home / "AppData" / "Roaming"
+        win_local = sandbox_home / "AppData" / "Local"
+        win_roaming.mkdir(parents=True, exist_ok=True)
+        win_local.mkdir(parents=True, exist_ok=True)
+        env["USERPROFILE"] = str(sandbox_home)
+        env["APPDATA"] = str(win_roaming)
+        env["LOCALAPPDATA"] = str(win_local)
     safe_bin_dirs = [
         str(host_home / ".local" / "bin"),
         str(host_home / ".cargo" / "bin"),
         str(host_home / ".bun" / "bin"),
-        "/opt/homebrew/bin",
-        "/opt/homebrew/sbin",
-        "/usr/local/bin",
     ]
-    existing_path_parts = [p for p in env.get("PATH", "").split(":") if p]
+    if sys.platform != "win32":
+        safe_bin_dirs.extend(["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"])
+    existing_path_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
     for bdir in reversed(safe_bin_dirs):
         if Path(bdir).is_dir() and bdir not in existing_path_parts:
             existing_path_parts.insert(0, bdir)
     if existing_path_parts:
-        env["PATH"] = ":".join(existing_path_parts)
+        env["PATH"] = os.pathsep.join(existing_path_parts)
     if manifest.auth_mode == "isolated-file":
         env["SSH_CONNECTION"] = "local"
     else:
@@ -463,6 +524,19 @@ def launch_profile(
 
 
 def _pid_is_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return int(exit_code.value) == STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -470,6 +544,21 @@ def _pid_is_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+
+
+def _force_kill_pid(pid: int) -> None:
+    if sys.platform == "win32":
+        proc = subprocess.run(
+            ["taskkill", "/PID", str(int(pid)), "/F"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode != 0 and not _pid_is_alive(pid):
+            raise ProcessLookupError(pid)
+        return
+    os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
 def stop_profile(
@@ -526,7 +615,7 @@ def stop_profile(
         for pid in remaining:
             if pid in live_verified:
                 try:
-                    os.kill(pid, signal.SIGKILL)
+                    _force_kill_pid(pid)
                     forced_pids.append(pid)
                 except ProcessLookupError:
                     pass
@@ -619,7 +708,7 @@ def repair_host_hub(
         for pid in remaining:
             if pid in fresh_pids:
                 try:
-                    os.kill(pid, signal.SIGKILL)
+                    _force_kill_pid(pid)
                     forced_pids.append(pid)
                 except ProcessLookupError:
                     pass
@@ -645,14 +734,19 @@ def repair_host_hub(
                 "Host Antigravity.app is not installed in /Applications.",
                 "Install Antigravity.app in /Applications and retry.",
             )
-        clean_env: Dict[str, str] = {
-            "HOME": str(host_home),
-            "USER": os.environ.get("USER") or host_home.name,
-            "LOGNAME": os.environ.get("LOGNAME") or host_home.name,
-            "SHELL": os.environ.get("SHELL") or "/bin/zsh",
-            "TMPDIR": os.environ.get("TMPDIR") or "/tmp",
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        }
+        if sys.platform == "win32":
+            clean_env = os.environ.copy()
+            clean_env["HOME"] = str(host_home)
+            clean_env["USERPROFILE"] = str(host_home)
+        else:
+            clean_env = {
+                "HOME": str(host_home),
+                "USER": os.environ.get("USER") or host_home.name,
+                "LOGNAME": os.environ.get("LOGNAME") or host_home.name,
+                "SHELL": os.environ.get("SHELL") or "/bin/zsh",
+                "TMPDIR": os.environ.get("TMPDIR") or "/tmp",
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            }
         if sys.platform == "darwin" and Path("/usr/bin/open").exists():
             proc = subprocess.run(
                 ["/usr/bin/open", "-n", "-a", hub_info.app_path],

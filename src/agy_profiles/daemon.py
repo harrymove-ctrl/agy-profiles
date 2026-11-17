@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-import fcntl
+import sys
+
+if sys.platform == "win32":
+    import msvcrt
+    fcntl = None  # type: ignore[assignment]
+else:
+    import fcntl
+    msvcrt = None  # type: ignore[assignment]
 import json
 import os
 from pathlib import Path
@@ -47,10 +54,29 @@ def validate_port_number(port: int) -> int:
     return val
 
 
+def _lock_file_nonblocking(fh: IO[str]) -> None:
+    if fcntl is not None:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    elif msvcrt is not None:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+
+
+def _unlock_file(fh: IO[str]) -> None:
+    if fcntl is not None:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def acquire_watchdog_lock(root: Path) -> Optional[IO[str]]:
-    """Acquire non-blocking exclusive flock on <root>/.watchdog.lock so only one watchdog runs."""
+    """Acquire non-blocking exclusive lock on <root>/.watchdog.lock so only one watchdog runs."""
     root.mkdir(parents=True, exist_ok=True)
-    os.chmod(str(root), 0o700)
+    try:
+        os.chmod(str(root), 0o700)
+    except OSError:
+        pass
     lock_path = root / WATCHDOG_LOCK_FILENAME
     fh = open(lock_path, "a+", encoding="utf-8")
     try:
@@ -58,7 +84,7 @@ def acquire_watchdog_lock(root: Path) -> Optional[IO[str]]:
     except OSError:
         pass
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_file_nonblocking(fh)
     except OSError:
         fh.close()
         return None
@@ -84,7 +110,7 @@ def is_watchdog_locked(root: Path) -> Dict[str, Any]:
     probe = acquire_watchdog_lock(root)
     if probe is not None:
         try:
-            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+            _unlock_file(probe)
         except OSError:
             pass
         probe.close()
@@ -368,7 +394,7 @@ def _stop_stray_daemons(port: int) -> List[int]:
 
 
 def _launchctl_domain() -> str:
-    return "gui/{}".format(os.getuid())
+    return "gui/{}".format(getattr(os, "getuid", lambda: 0)())
 
 
 def _launchctl_reload(plist_path: Path, label: str) -> Dict[str, Any]:
