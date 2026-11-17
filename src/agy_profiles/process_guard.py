@@ -28,12 +28,20 @@ DATA_SUBDIR_BY_TARGET: Dict[str, str] = {
     "ide": "ide-data",
 }
 
+HOST_DATA_DIR_RELPATHS: Dict[str, str] = {
+    "hub": "Library/Application Support/Antigravity",
+    "ide": "Library/Application Support/Antigravity IDE",
+}
+
 LOCK_FILENAMES: Tuple[str, ...] = (
     "SingletonLock",
     "SingletonSocket",
     "SingletonCookie",
     "DevToolsActivePort",
 )
+
+_PROCESS_TYPE_RE = re.compile(r"(?:^|\s)--type=")
+_USER_DATA_DIR_FLAG_RE = re.compile(r"(?:^|\s)--user-data-dir(?:=|\s)")
 
 
 def list_all_processes() -> List[Dict[str, Any]]:
@@ -76,6 +84,44 @@ def command_matches_user_data_dir(command: str, resolved_data_dir: str) -> bool:
     return bool(re.search(pattern, command))
 
 
+def command_matches_host_target(
+    command: str,
+    binary_path: str,
+    default_data_dir: Path,
+    allow_default_no_flag: bool = True,
+) -> bool:
+    """Match a primary Host Antigravity root process while excluding sandbox instances."""
+    if not binary_path:
+        return False
+    if command != binary_path and not command.startswith(binary_path + " "):
+        return False
+    if _PROCESS_TYPE_RE.search(command):
+        return False
+    if _USER_DATA_DIR_FLAG_RE.search(command):
+        return command_matches_user_data_dir(command, str(default_data_dir.resolve()))
+    return bool(allow_default_no_flag)
+
+
+def _expand_process_tree(
+    rows: List[Dict[str, Any]],
+    seed_pids: Set[int],
+) -> List[Dict[str, Any]]:
+    """Expand seed PIDs to include all direct and indirect child processes."""
+    if not seed_pids:
+        return []
+    matched_pids = set(seed_pids)
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            pid = int(row["pid"])
+            ppid = int(row["ppid"])
+            if ppid in matched_pids and pid not in matched_pids:
+                matched_pids.add(pid)
+                changed = True
+    return [row for row in rows if int(row["pid"]) in matched_pids]
+
+
 def list_profile_processes(
     profile_dir: Path,
     ps_rows: Optional[List[Dict[str, Any]]] = None,
@@ -86,24 +132,12 @@ def list_profile_processes(
 
     for target, subdir in DATA_SUBDIR_BY_TARGET.items():
         data_dir = str((profile_dir / subdir).resolve())
-        matched_pids: Set[int] = set()
-        for row in rows:
-            if command_matches_user_data_dir(str(row.get("command", "")), data_dir):
-                matched_pids.add(int(row["pid"]))
-
-        # Include direct and indirect child processes (such as language_server and helpers).
-        if matched_pids:
-            changed = True
-            while changed:
-                changed = False
-                for row in rows:
-                    pid = int(row["pid"])
-                    ppid = int(row["ppid"])
-                    if ppid in matched_pids and pid not in matched_pids:
-                        matched_pids.add(pid)
-                        changed = True
-
-        out[target] = [row for row in rows if int(row["pid"]) in matched_pids]
+        matched_pids: Set[int] = {
+            int(row["pid"])
+            for row in rows
+            if command_matches_user_data_dir(str(row.get("command", "")), data_dir)
+        }
+        out[target] = _expand_process_tree(rows, matched_pids)
     return out
 
 
@@ -118,6 +152,19 @@ def inspect_locks(
     pids = [int(p["pid"]) for p in procs]
 
     data_dir = profile_dir / DATA_SUBDIR_BY_TARGET[valid_target]
+    resolved_data_dir = str(data_dir.resolve())
+    root_pids = sorted(
+        int(p["pid"])
+        for p in procs
+        if command_matches_user_data_dir(str(p.get("command", "")), resolved_data_dir)
+        and not _PROCESS_TYPE_RE.search(str(p.get("command", "")))
+    )
+    if not root_pids and pids:
+        root_pids = [pids[0]]
+    schedule_count = sum(
+        1 for p in procs if "multicall schedule" in str(p.get("command", ""))
+    )
+
     existing_locks: List[str] = []
     for fname in LOCK_FILENAMES:
         candidate = data_dir / fname
@@ -138,9 +185,77 @@ def inspect_locks(
     return {
         "target": valid_target,
         "state": state,
+        "root_pids": root_pids,
         "pids": pids,
+        "schedule_count": schedule_count,
         "lock_files": existing_locks,
     }
+
+
+def inspect_host_runtime(
+    real_home: Optional[Path] = None,
+    targets: Optional[Dict[str, TargetInfo]] = None,
+    ps_rows: Optional[List[Dict[str, Any]]] = None,
+    allow_default_no_flag: Optional[bool] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Inspect live runtime state and cron runners for primary Host Antigravity targets."""
+    host_home = (real_home if real_home is not None else Path.home()).resolve()
+    effective_allow_no_flag = (
+        bool(allow_default_no_flag)
+        if allow_default_no_flag is not None
+        else (real_home is None or host_home == Path.home().resolve())
+    )
+    target_map = targets if targets is not None else detect_targets()
+    rows = ps_rows if ps_rows is not None else list_all_processes()
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for tgt in ("hub", "ide"):
+        default_data_dir = host_home / HOST_DATA_DIR_RELPATHS[tgt]
+        info = target_map.get(tgt)
+        bin_path = (info.binary_path or "") if info and info.installed else ""
+        initial_roots: Set[int] = set()
+        if bin_path:
+            for row in rows:
+                if command_matches_host_target(
+                    str(row.get("command", "")),
+                    bin_path,
+                    default_data_dir,
+                    allow_default_no_flag=effective_allow_no_flag,
+                ):
+                    initial_roots.add(int(row["pid"]))
+
+        matched_rows = _expand_process_tree(rows, initial_roots)
+        pids = [int(r["pid"]) for r in matched_rows]
+        root_pids = sorted(initial_roots)
+        if not root_pids and pids:
+            root_pids = [pids[0]]
+        schedule_count = sum(
+            1 for r in matched_rows if "multicall schedule" in str(r.get("command", ""))
+        )
+
+        existing_locks: List[str] = []
+        if default_data_dir.is_dir():
+            for fname in LOCK_FILENAMES:
+                candidate = default_data_dir / fname
+                if candidate.exists() or candidate.is_symlink():
+                    existing_locks.append(fname)
+
+        if pids:
+            state = "running"
+        elif existing_locks:
+            state = "stale-lock"
+        else:
+            state = "stopped"
+
+        out[tgt] = {
+            "target": tgt,
+            "state": state,
+            "root_pids": root_pids,
+            "pids": pids,
+            "schedule_count": schedule_count,
+            "lock_files": existing_locks,
+        }
+    return out
 
 
 def _unlink_lock_path(base: Path, target_path: Path) -> None:
@@ -255,12 +370,27 @@ def launch_profile(
         cmd.append(str(ws_resolved))
         cwd_path = str(ws_resolved if ws_resolved.is_dir() else ws_resolved.parent)
 
+    host_home = (real_home if real_home is not None else Path.home()).resolve()
     env = os.environ.copy()
     env["HOME"] = str(sandbox_home)
     env["ZDOTDIR"] = str(sandbox_home)
     env["XDG_CONFIG_HOME"] = str(sandbox_home / ".config")
     env["XDG_DATA_HOME"] = str(sandbox_home / ".local" / "share")
     env["XDG_CACHE_HOME"] = str(sandbox_home / ".cache")
+    safe_bin_dirs = [
+        str(host_home / ".local" / "bin"),
+        str(host_home / ".cargo" / "bin"),
+        str(host_home / ".bun" / "bin"),
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+    ]
+    existing_path_parts = [p for p in env.get("PATH", "").split(":") if p]
+    for bdir in reversed(safe_bin_dirs):
+        if Path(bdir).is_dir() and bdir not in existing_path_parts:
+            existing_path_parts.insert(0, bdir)
+    if existing_path_parts:
+        env["PATH"] = ":".join(existing_path_parts)
     if manifest.auth_mode == "isolated-file":
         env["SSH_CONNECTION"] = "local"
     else:

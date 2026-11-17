@@ -18,6 +18,7 @@ import type {
   CloneProfilePayload,
   CreateProfilePayload,
   LinkPolicy,
+  RenameProfilePayload,
   TargetKind,
 } from "../types";
 
@@ -36,9 +37,9 @@ export function CreateProfileDrawer({
   const [label, setLabel] = useState("");
   const [accent, setAccent] = useState(ACCENT_PRESETS[0].hex);
   const [defaultTarget, setDefaultTarget] = useState<TargetKind>("hub");
-  const [linkPolicy, setLinkPolicy] = useState<LinkPolicy>("minimal");
+  const [linkPolicy, setLinkPolicy] = useState<LinkPolicy>("dev");
   const [authMode, setAuthMode] = useState<AuthMode>("isolated-file");
-  const [inheritConfig, setInheritConfig] = useState(false);
+  const [inheritConfig, setInheritConfig] = useState(true);
   const [keepBg, setKeepBg] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -49,9 +50,9 @@ export function CreateProfileDrawer({
       setLabel("");
       setAccent(ACCENT_PRESETS[0].hex);
       setDefaultTarget("hub");
-      setLinkPolicy("minimal");
+      setLinkPolicy("dev");
       setAuthMode("isolated-file");
-      setInheritConfig(false);
+      setInheritConfig(true);
       setKeepBg(false);
       setErrorMsg(null);
     }
@@ -158,7 +159,7 @@ export function CreateProfileDrawer({
                     options={[
                       { value: "none", label: "None (zero host links)" },
                       { value: "minimal", label: "Minimal (fonts and safe caches)" },
-                      { value: "dev", label: "Dev (toolchain caches)" },
+                      { value: "dev", label: "Dev (toolchains and .agents)" },
                     ]}
                   />
                   <Selector
@@ -177,8 +178,8 @@ export function CreateProfileDrawer({
                     ]}
                   />
                   <CheckboxInput
-                    label="Copy sanitized host GEMINI.md and MCP config"
-                    description="Redacts tokens and fails closed on invalid JSON."
+                    label="Sync sanitized host setup and handoff"
+                    description="Copies projects, plugins, agents, skills, rules, and MCP JSON with tokens redacted and Automations placed in paused standby."
                     value={inheritConfig}
                     onChange={(checked) => setInheritConfig(checked)}
                   />
@@ -231,6 +232,7 @@ export function CloneProfileDrawer({
 }: CloneProfileDrawerProps) {
   const [target, setTarget] = useState("");
   const [label, setLabel] = useState("");
+  const [freshAuth, setFreshAuth] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -238,6 +240,7 @@ export function CloneProfileDrawer({
     if (isOpen && sourceName) {
       setTarget(`${sourceName}-copy`);
       setLabel(sourceLabel ? `${sourceLabel} Copy` : "");
+      setFreshAuth(false);
       setErrorMsg(null);
     }
   }, [isOpen, sourceName, sourceLabel]);
@@ -258,6 +261,7 @@ export function CloneProfileDrawer({
       await onClone(sourceName, {
         target: slug,
         label: label.trim() || undefined,
+        fresh_auth: freshAuth,
       });
       onOpenChange(false);
     } catch (err) {
@@ -313,6 +317,12 @@ export function CloneProfileDrawer({
                     value={label}
                     onChange={setLabel}
                   />
+                  <CheckboxInput
+                    label="Start with fresh Google login (strip OAuth)"
+                    description="Keeps synced setup and IDE layout while removing OAuth tokens so a separate Google account signs in."
+                    value={freshAuth}
+                    onChange={(checked) => setFreshAuth(checked)}
+                  />
                 </FormLayout>
               </VStack>
             </form>
@@ -331,6 +341,154 @@ export function CloneProfileDrawer({
               form="agyp-clone-form"
               variant="primary"
               label="Clone Profile"
+              isLoading={submitting}
+            />
+          </HStack>
+        }
+      />
+    </Drawer>
+  );
+}
+
+export interface RenameProfileDrawerProps {
+  sourceName: string | null;
+  sourceLabel: string | null;
+  detectedEmail?: string | null;
+  isRunning: boolean;
+  isOpen: boolean;
+  onOpenChange: (open: boolean) => void;
+  onRename: (source: string, payload: RenameProfilePayload) => Promise<void>;
+}
+
+export function RenameProfileDrawer({
+  sourceName,
+  sourceLabel,
+  detectedEmail = null,
+  isRunning,
+  isOpen,
+  onOpenChange,
+  onRename,
+}: RenameProfileDrawerProps) {
+  const [target, setTarget] = useState("");
+  const [label, setLabel] = useState("");
+  const [restart, setRestart] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (isOpen && sourceName) {
+      const localPart = detectedEmail
+        ? detectedEmail
+            .split("@")[0]
+            .toLowerCase()
+            .replace(/[^a-z0-9._-]+/g, "-")
+        : "";
+      const suggestedSlug =
+        localPart && localPart !== sourceName ? localPart : sourceName;
+      setTarget(suggestedSlug);
+      setLabel(detectedEmail || sourceLabel || "");
+      setRestart(isRunning);
+      setErrorMsg(null);
+    }
+  }, [detectedEmail, isOpen, isRunning, sourceLabel, sourceName]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!sourceName) {
+      return;
+    }
+    const slug = target.trim();
+    if (!slug) {
+      setErrorMsg("Enter a destination profile slug.");
+      return;
+    }
+    setSubmitting(true);
+    setErrorMsg(null);
+    try {
+      await onRename(sourceName, {
+        target: slug,
+        label: label.trim() || undefined,
+        restart,
+      });
+      onOpenChange(false);
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error ? err.message : "Failed to rename profile."
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Drawer
+      isOpen={isOpen}
+      onOpenChange={onOpenChange}
+      label="Rename Profile"
+      side="end"
+      width={440}
+      purpose="form"
+    >
+      <Layout
+        header={
+          <DrawerHeader
+            title="Rename Profile"
+            subtitle="Keeps OAuth login and retargets sandbox links safely."
+            onOpenChange={onOpenChange}
+          />
+        }
+        content={
+          <LayoutContent>
+            <form id="agyp-rename-form" onSubmit={handleSubmit}>
+              <VStack gap={4}>
+                {errorMsg ? (
+                  <Banner
+                    status="error"
+                    title="Unable to rename profile"
+                    description={errorMsg}
+                  />
+                ) : null}
+                <HStack gap={2} vAlign="center">
+                  <Text type="label">Current slug:</Text>
+                  <Code>{sourceName ?? ""}</Code>
+                </HStack>
+                <FormLayout direction="vertical">
+                  <TextInput
+                    label="New Profile Slug"
+                    description="Matches folder name inside the profiles root."
+                    value={target}
+                    onChange={setTarget}
+                    isRequired
+                  />
+                  <TextInput
+                    label="Display Label"
+                    value={label}
+                    onChange={setLabel}
+                  />
+                  <CheckboxInput
+                    label="Stop and relaunch active processes"
+                    description="Required when the profile is currently running."
+                    value={restart}
+                    onChange={(checked) => setRestart(checked)}
+                  />
+                </FormLayout>
+              </VStack>
+            </form>
+          </LayoutContent>
+        }
+        footer={
+          <HStack gap={2} hAlign="end">
+            <Button
+              variant="ghost"
+              label="Cancel"
+              isDisabled={submitting}
+              onClick={() => onOpenChange(false)}
+            />
+            <Button
+              type="submit"
+              form="agyp-rename-form"
+              variant="primary"
+              label="Rename Profile"
               isLoading={submitting}
             />
           </HStack>

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
-from typing import Any, Callable, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agy_profiles import __version__
 from agy_profiles.config import (
@@ -26,6 +29,7 @@ from agy_profiles.config import (
     save_manifest,
     validate_accent,
     validate_auth_mode,
+    validate_automations_mode,
     validate_link_policy,
     validate_profile_name,
     validate_target,
@@ -41,25 +45,32 @@ from agy_profiles.evidence import (
 from agy_profiles.isolation import (
     ALL_MANAGED_LINKS,
     audit_profile_isolation,
+    collect_handoff_from_gemini,
     collect_host_handoff,
     detect_host_account,
     detect_profile_account,
     inherit_host_customizations,
     inspect_profile_sync_state,
+    pause_host_automations,
     provision_profile_dirs,
+    restore_host_automations,
     sanitize_mcp_json_text,
+    sync_conversation_sessions,
     sync_host_customizations,
     validate_link_relpath,
+    write_host_handoff_context,
 )
 from agy_profiles.macos_launcher import (
     build_launcher,
     remove_launcher,
     resolve_launcher_bundle_path,
+    verify_launcher_signature,
 )
 from agy_profiles.process_guard import (
     DATA_SUBDIR_BY_TARGET,
     LOCK_FILENAMES,
     command_matches_user_data_dir,
+    inspect_host_runtime,
     inspect_locks,
     launch_profile,
     list_all_processes,
@@ -88,11 +99,26 @@ class ToolSpec:
     mutates: bool = False
 
 
+DISK_CACHE_TTL_SEC = 30.0
+_DISK_SIZE_CACHE: Dict[str, Tuple[float, int]] = {}
+
+
+def invalidate_disk_size_cache() -> None:
+    """Clear cached sandbox disk-usage entries after mutating operations."""
+    _DISK_SIZE_CACHE.clear()
+
+
 def _dir_size_bytes_no_follow(path: Path) -> int:
-    """Compute disk usage inside a directory without following symlinks."""
-    total = 0
+    """Compute disk usage inside a directory without following symlinks (30s TTL cache)."""
     if not path.is_dir():
         return 0
+    cache_key = str(path.resolve())
+    now = time.monotonic()
+    cached = _DISK_SIZE_CACHE.get(cache_key)
+    if cached is not None and (now - cached[0]) <= DISK_CACHE_TTL_SEC:
+        return cached[1]
+
+    total = 0
     for dirpath, dirnames, filenames in os.walk(str(path), followlinks=False):
         # Prune symlinked directories so linked host directories are never traversed.
         kept_dirs: List[str] = []
@@ -109,7 +135,15 @@ def _dir_size_bytes_no_follow(path: Path) -> int:
                 total += os.path.getsize(full_f)
             except OSError:
                 pass
+    _DISK_SIZE_CACHE[cache_key] = (now, total)
     return total
+
+
+def _default_launcher_dest(ctx: RuntimeContext) -> Optional[Path]:
+    """Return hermetic Applications directory when ctx overrides real_home."""
+    if ctx.real_home is not None:
+        return ctx.real_home.expanduser() / "Applications"
+    return None
 
 
 def _build_profile_summary(
@@ -117,12 +151,13 @@ def _build_profile_summary(
     profile_dir: Path,
     manifest: ProfileManifest,
     ps_rows: List[Dict[str, Any]],
+    launcher_dest: Optional[Path] = None,
 ) -> Dict[str, Any]:
     hub_rt = inspect_locks(profile_dir, "hub", ps_rows=ps_rows)
     ide_rt = inspect_locks(profile_dir, "ide", ps_rows=ps_rows)
     launchers = {
-        "hub": resolve_launcher_bundle_path(manifest.name, manifest.label, "hub").exists(),
-        "ide": resolve_launcher_bundle_path(manifest.name, manifest.label, "ide").exists(),
+        "hub": resolve_launcher_bundle_path(manifest.name, manifest.label, "hub", dest_dir=launcher_dest).exists(),
+        "ide": resolve_launcher_bundle_path(manifest.name, manifest.label, "ide", dest_dir=launcher_dest).exists(),
     }
     return {
         "manifest": manifest.to_dict(),
@@ -156,12 +191,86 @@ def _resolve_cli_bin(ctx: RuntimeContext) -> str:
     return sys.executable
 
 
+def _compute_quota_flow(
+    host_account: Dict[str, Any],
+    host_runtime: Dict[str, Dict[str, Any]],
+    profiles: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize active quota ownership and automation cron state across Host and backup profiles."""
+    hub_rt = host_runtime.get("hub") or {}
+    ide_rt = host_runtime.get("ide") or {}
+    host_running = hub_rt.get("state") == "running" or ide_rt.get("state") == "running"
+    host_schedule_count = int(hub_rt.get("schedule_count") or 0) + int(
+        ide_rt.get("schedule_count") or 0
+    )
+    host_auto_enabled = int(host_account.get("automations_enabled") or 0)
+
+    active_profiles: List[str] = []
+    standby_profiles: List[str] = []
+    for entry in profiles:
+        pname = str((entry.get("manifest") or {}).get("name") or "")
+        if not pname:
+            continue
+        sync_st = entry.get("sync_state") or {}
+        rt = entry.get("runtime") or {}
+        prof_enabled = int(sync_st.get("automations_enabled") or 0)
+        prof_crons = int((rt.get("hub") or {}).get("schedule_count") or 0) + int(
+            (rt.get("ide") or {}).get("schedule_count") or 0
+        )
+        if prof_enabled > 0 or prof_crons > 0:
+            active_profiles.append(pname)
+        else:
+            standby_profiles.append(pname)
+
+    if not profiles:
+        mode = "no_profiles"
+        active_owner = "host"
+        dual_warn = False
+        summary = "Main Antigravity is active without any backup profiles provisioned yet."
+    elif active_profiles and (host_schedule_count > 0 or (host_running and host_auto_enabled > 0)):
+        mode = "dual_active"
+        active_owner = active_profiles[0]
+        dual_warn = True
+        summary = (
+            "Both Main Antigravity and {} have active automations; "
+            "return to Host to pause backup crons or quit Main Antigravity."
+        ).format(", ".join(active_profiles))
+    elif active_profiles:
+        mode = "backup_active"
+        active_owner = active_profiles[0]
+        dual_warn = False
+        summary = "Backup profile {} currently owns active quota and scheduled automations.".format(
+            active_profiles[0]
+        )
+    else:
+        mode = "host_primary"
+        active_owner = "host"
+        dual_warn = False
+        summary = (
+            "Main Antigravity owns active quota and automations while {} {} ready in paused standby."
+        ).format(
+            len(standby_profiles),
+            "profile is" if len(standby_profiles) == 1 else "profiles are",
+        )
+
+    return {
+        "mode": mode,
+        "active_owner": active_owner,
+        "active_profiles": active_profiles,
+        "standby_profiles": standby_profiles,
+        "host_running": host_running,
+        "host_schedule_count": host_schedule_count,
+        "dual_automations_warning": dual_warn,
+        "summary": summary,
+    }
+
+
 def _handle_profile_list(ctx: RuntimeContext, _params: Dict[str, Any]) -> Dict[str, Any]:
     root = ctx.root
     targets = detect_targets()
+    ps_rows = list_all_processes()
     profiles: List[Dict[str, Any]] = []
     if root.is_dir():
-        ps_rows = list_all_processes()
         for entry in sorted(root.iterdir(), key=lambda p: p.name.lower()):
             if not entry.is_dir() or entry.is_symlink():
                 continue
@@ -172,11 +281,28 @@ def _handle_profile_list(ctx: RuntimeContext, _params: Dict[str, Any]) -> Dict[s
                 _, manifest = load_manifest(root, entry.name)
             except ToolError:
                 continue
-            profiles.append(_build_profile_summary(root, entry, manifest, ps_rows))
+            profiles.append(
+                _build_profile_summary(
+                    root,
+                    entry,
+                    manifest,
+                    ps_rows,
+                    launcher_dest=_default_launcher_dest(ctx),
+                )
+            )
+    host_account = detect_host_account(real_home=ctx.real_home)
+    host_runtime = inspect_host_runtime(
+        real_home=ctx.real_home,
+        targets=targets,
+        ps_rows=ps_rows,
+    )
+    flow = _compute_quota_flow(host_account, host_runtime, profiles)
     return {
         "root": str(root),
         "default_root": str(resolve_profiles_root()),
-        "host_account": detect_host_account(real_home=ctx.real_home),
+        "host_account": host_account,
+        "host_runtime": host_runtime,
+        "flow": flow,
         "targets": {k: v.to_dict() for k, v in targets.items()},
         "profiles": profiles,
     }
@@ -207,12 +333,57 @@ def _parse_handoff_limit(params: Dict[str, Any]) -> int:
     return val
 
 
+def _resolve_handoff_source(
+    ctx: RuntimeContext,
+    raw_source: Optional[str],
+) -> Tuple[str, Optional[Path], Optional[str]]:
+    clean = str(raw_source or "host").strip() or "host"
+    if clean.lower() == "host":
+        return "host", None, None
+    src_name = validate_profile_name(clean)
+    src_dir, src_manifest = load_manifest(ctx.root, src_name)
+    src_gemini = ensure_within_root(src_dir, src_dir / "home" / ".gemini")
+    acct = detect_profile_account(src_dir).get("email") or src_manifest.label
+    return src_manifest.name, src_gemini, acct
+
+
+def _parse_session_limit(params: Dict[str, Any]) -> int:
+    raw = params.get("session_limit", 25)
+    if isinstance(raw, bool):
+        raise ToolError(
+            "invalid_argument",
+            "Session limit must be an integer between 1 and 100.",
+            "Pass an integer session_limit between 1 and 100.",
+        )
+    try:
+        val = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ToolError(
+            "invalid_argument",
+            "Session limit must be an integer between 1 and 100.",
+            "Pass an integer session_limit between 1 and 100.",
+        ) from exc
+    if val < 1 or val > 100:
+        raise ToolError(
+            "invalid_argument",
+            "Session limit {} is out of range (1 to 100).".format(val),
+            "Pass an integer session_limit between 1 and 100.",
+        )
+    return val
+
+
 def _handle_profile_sync(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
     name = validate_profile_name(str(params.get("name") or ""))
     include_sidecars = bool(params.get("include_sidecars", False))
+    raw_mode = params.get("automations_mode")
+    automations_mode = validate_automations_mode(str(raw_mode)) if raw_mode is not None else None
     include_handoff = bool(params.get("include_handoff", True))
+    include_sessions = bool(params.get("include_sessions", True))
+    turbo_bypass = bool(params.get("turbo_bypass", True))
+    session_limit = _parse_session_limit(params)
     restart = bool(params.get("restart", False))
     limit = _parse_handoff_limit(params)
+    source_name, source_gemini, source_account = _resolve_handoff_source(ctx, params.get("from_source"))
 
     profile_dir, manifest = load_manifest(ctx.root, name)
     stop_res: Optional[Dict[str, Any]] = None
@@ -225,8 +396,15 @@ def _handle_profile_sync(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[st
         profile_dir,
         real_home=ctx.real_home,
         include_sidecars=include_sidecars,
+        automations_mode=automations_mode,
         include_handoff=include_handoff,
         handoff_limit=limit,
+        handoff_source_gemini=source_gemini,
+        handoff_source_account=source_account,
+        handoff_source_name=source_name,
+        include_sessions=include_sessions,
+        session_limit=session_limit,
+        turbo_bypass=turbo_bypass,
     )
 
     if restart:
@@ -239,28 +417,46 @@ def _handle_profile_sync(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[st
         )
 
     ps_rows = list_all_processes()
-    summary = _build_profile_summary(ctx.root, profile_dir, manifest, ps_rows)
+    summary = _build_profile_summary(
+        ctx.root,
+        profile_dir,
+        manifest,
+        ps_rows,
+        launcher_dest=_default_launcher_dest(ctx),
+    )
     ev = EvidenceRecord(
         operation="profile_sync",
         authority="filesystem",
         confidence="observed",
-        summary="Synced {} projects, {} plugins, {} agents into '{}' (redacted {}, stripped {} sidecars).".format(
+        summary=(
+            "Synced {} projects, {} automations ({} active, mode={}), {} plugins, {} agents into '{}' "
+            "(redacted {}, pruned {}, stripped {} sidecars)."
+        ).format(
             sync_res["projects_synced"],
+            sync_res["automations_synced"],
+            sync_res["automations_enabled"],
+            sync_res["automations_mode"],
             sync_res["plugins_synced"],
             sync_res["agents_synced"],
             manifest.name,
             sync_res["redacted_secrets"],
+            sync_res["pruned_entries"],
             sync_res["stripped_sidecars"],
         ),
         facts={
             "profile": manifest.name,
             "restarted": restart,
+            "automations_mode": sync_res["automations_mode"],
+            "automations_synced": sync_res["automations_synced"],
+            "automations_enabled": sync_res["automations_enabled"],
             "projects_synced": sync_res["projects_synced"],
+            "pruned_entries": sync_res["pruned_entries"],
             "plugins_synced": sync_res["plugins_synced"],
             "agents_synced": sync_res["agents_synced"],
             "skills_synced": sync_res["skills_synced"],
             "redacted_secrets": sync_res["redacted_secrets"],
             "stripped_sidecars": sync_res["stripped_sidecars"],
+            "handoff_source": source_name,
             "handoff_written": bool(sync_res["handoff"].get("written")),
         },
         limitations=[],
@@ -275,21 +471,33 @@ def _handle_profile_sync(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[st
 
 def _handle_host_handoff(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
     limit = _parse_handoff_limit(params)
-    digest = collect_host_handoff(real_home=ctx.real_home, limit=limit)
+    source_name, source_gemini, source_account = _resolve_handoff_source(ctx, params.get("source"))
     host_account = detect_host_account(real_home=ctx.real_home)
+    if source_gemini is not None:
+        digest = collect_handoff_from_gemini(
+            source_gemini,
+            source_account,
+            source_name=source_name,
+            limit=limit,
+        )
+    else:
+        digest = collect_host_handoff(real_home=ctx.real_home, limit=limit)
     ev = EvidenceRecord(
         operation="host_handoff",
         authority="filesystem",
         confidence="observed" if digest.get("available") else "inferred",
-        summary="Read {} Host conversations read-only for cross-account handoff.".format(
-            digest["count"]
+        summary="Read {} {} conversations read-only for cross-account handoff.".format(
+            digest["count"],
+            "Host" if source_name == "host" else source_name,
         ),
         facts={
             "available": digest["available"],
+            "source": source_name,
             "count": digest["count"],
             "host_account": host_account.get("email"),
+            "source_account": digest.get("source_account"),
         },
-        limitations=([] if digest.get("available") else [str(digest.get("reason") or "Host database unavailable.")]),
+        limitations=([] if digest.get("available") else [str(digest.get("reason") or "Conversation database unavailable.")]),
     )
     digest["host_account_details"] = host_account
     digest["evidence"] = ev.to_dict()
@@ -300,7 +508,13 @@ def _handle_profile_inspect(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict
     name = str(params.get("name") or "")
     profile_dir, manifest = load_manifest(ctx.root, name)
     ps_rows = list_all_processes()
-    summary = _build_profile_summary(ctx.root, profile_dir, manifest, ps_rows)
+    summary = _build_profile_summary(
+        ctx.root,
+        profile_dir,
+        manifest,
+        ps_rows,
+        launcher_dest=_default_launcher_dest(ctx),
+    )
     iso = audit_profile_isolation(profile_dir, manifest)
     ev = EvidenceRecord(
         operation="profile_inspect",
@@ -350,7 +564,7 @@ def _handle_profile_create(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[
     default_target = validate_target(str(params.get("default_target") or "hub"))
     link_policy = validate_link_policy(str(params.get("link_policy") or "minimal"))
     auth_mode = validate_auth_mode(str(params.get("auth_mode") or "isolated-file"))
-    keep_bg = bool(params.get("keep_background_alive", False))
+    keep_bg = bool(params.get("keep_background_alive", True))
     inherit_cfg = bool(params.get("inherit_config", False))
 
     targets = detect_targets()
@@ -387,6 +601,7 @@ def _handle_profile_create(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[
 def _handle_profile_update(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
     name = validate_profile_name(str(params.get("name") or ""))
     profile_dir, manifest = load_manifest(ctx.root, name)
+    old_label = manifest.label
 
     if "label" in params and params["label"] is not None:
         cleaned_label = str(params["label"]).strip()
@@ -410,6 +625,26 @@ def _handle_profile_update(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[
 
     provision_profile_dirs(ctx.root, manifest, real_home=ctx.real_home)
     save_manifest(ctx.root, profile_dir, manifest)
+
+    if manifest.label != old_label:
+        launcher_dest = _default_launcher_dest(ctx)
+        existing_targets = [
+            tgt
+            for tgt in ("hub", "ide")
+            if resolve_launcher_bundle_path(name, old_label, tgt, dest_dir=launcher_dest).exists()
+        ]
+        cli_bin = _resolve_cli_bin(ctx)
+        for tgt in existing_targets:
+            remove_launcher(name, old_label, tgt, dest_dir=launcher_dest)
+            build_launcher(
+                profile_name=name,
+                label=manifest.label,
+                target=tgt,
+                cli_bin_path=cli_bin,
+                dest_dir=launcher_dest,
+                root=ctx.root,
+            )
+
     return _handle_profile_inspect(ctx, {"name": name})
 
 
@@ -488,7 +723,7 @@ def _copy_tree_excluding_transient(src_root: Path, dst_root: Path) -> None:
                 continue
             dst_f = dst_dir / fname
             shutil.copy2(full_f, str(dst_f))
-            if fname == "jetski-standalone-oauth-token" or fname.endswith(".json"):
+            if fname in ("jetski-standalone-oauth-token", "credential-user-scope") or fname.endswith(".json"):
                 os.chmod(str(dst_f), 0o600)
 
 
@@ -539,11 +774,69 @@ def _handle_profile_clone(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[s
         last_host_versions=dict(src_manifest.last_host_versions),
     )
 
+    fresh_auth = bool(params.get("fresh_auth", False))
+
     try:
         provision_profile_dirs(ctx.root, dst_manifest, real_home=ctx.real_home)
         for sub in ("data", "ide-data"):
             _copy_tree_excluding_transient(src_dir / sub, dst_dir / sub)
         _copy_tree_excluding_transient(src_dir / "home" / ".gemini", dst_dir / "home" / ".gemini")
+        _copy_tree_excluding_transient(
+            src_dir / "home" / "Library" / "Application Support" / "antigravity",
+            dst_dir / "home" / "Library" / "Application Support" / "antigravity",
+        )
+        # Strip source installation_id and installation_uuid fingerprints so Antigravity Mobile
+        # treats the cloned profile as a distinct machine instance without handshake collisions.
+        for id_rel in (
+            Path("home") / ".gemini" / "installation_id",
+            Path("home") / ".gemini" / "antigravity" / "installation_id",
+            Path("home") / ".gemini" / "antigravity-cli" / "installation_id",
+        ):
+            id_path = ensure_within_root(dst_dir, dst_dir / id_rel)
+            if id_path.is_file() or id_path.is_symlink():
+                id_path.unlink()
+        for pbtxt_rel in (
+            Path("home") / ".gemini" / "antigravity" / "antigravity_state.pbtxt",
+            Path("home") / ".gemini" / "antigravity-cli" / "jetski_state.pbtxt",
+        ):
+            pb_path = ensure_within_root(dst_dir, dst_dir / pbtxt_rel)
+            if pb_path.is_file() and not pb_path.is_symlink():
+                kept_lines = [
+                    ln
+                    for ln in pb_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if not ln.lstrip().startswith("installation_uuid:")
+                ]
+                pb_path.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""), encoding="utf-8")
+                os.chmod(str(pb_path), 0o600)
+        if fresh_auth:
+            for cred_rel in (
+                Path("home") / ".gemini" / "jetski-standalone-oauth-token",
+                Path("home") / ".gemini" / "google_accounts.json",
+                Path("home") / "Library" / "Application Support" / "antigravity" / "credential-user-scope",
+            ):
+                cred_path = ensure_within_root(dst_dir, dst_dir / cred_rel)
+                if cred_path.is_file() or cred_path.is_symlink():
+                    cred_path.unlink()
+            for app_dir_name in ("data", "ide-data"):
+                storage_file = ensure_within_root(dst_dir, dst_dir / app_dir_name / "app_storage.json")
+                if storage_file.is_file():
+                    try:
+                        parsed_st = json.loads(storage_file.read_text(encoding="utf-8", errors="replace"))
+                        if isinstance(parsed_st, dict):
+                            cleaned_st = {
+                                k: v
+                                for k, v in parsed_st.items()
+                                if k != "agy.onboarding.lastLoginUsername" and not str(k).endswith("lastLoginUsername")
+                            }
+                            atomic_write_json(storage_file, cleaned_st, mode=0o600)
+                    except (OSError, ValueError):
+                        pass
+                for transient_auth in ("Cookies", "Cookies-journal", "Local Storage", "Session Storage"):
+                    tpath = ensure_within_root(dst_dir, dst_dir / app_dir_name / transient_auth)
+                    if tpath.is_dir() and not tpath.is_symlink():
+                        shutil.rmtree(str(tpath))
+                    elif tpath.is_file() or tpath.is_symlink():
+                        tpath.unlink()
         # Rewrite sandbox .zshenv and policy symlinks cleanly for the cloned home directory.
         provision_profile_dirs(ctx.root, dst_manifest, real_home=ctx.real_home)
         save_manifest(ctx.root, dst_dir, dst_manifest)
@@ -551,7 +844,143 @@ def _handle_profile_clone(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[s
         _safe_unlink_and_rmtree(ctx.root, dst_dir)
         raise
 
-    return _handle_profile_inspect(ctx, {"name": dst_name})
+    inspected = _handle_profile_inspect(ctx, {"name": dst_name})
+    inspected["fresh_auth"] = fresh_auth
+    return inspected
+
+
+def _retarget_internal_symlinks(src_dir: Path, dst_dir: Path) -> int:
+    """Rewrite internal absolute symlinks pointing into src_dir to point into dst_dir."""
+    dst_resolved = str(dst_dir.resolve())
+    src_resolved = str(src_dir.parent.resolve() / src_dir.name)
+    pairs = [(src_resolved, dst_resolved)]
+    if str(src_dir) != src_resolved:
+        pairs.append((str(src_dir), str(dst_dir)))
+
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(str(dst_dir), followlinks=False):
+        for entry in list(dirnames) + list(filenames):
+            full_path = os.path.join(dirpath, entry)
+            if not os.path.islink(full_path):
+                continue
+            raw_target = os.readlink(full_path)
+            new_target = raw_target
+            for old_prefix, new_prefix in pairs:
+                if raw_target == old_prefix:
+                    new_target = new_prefix
+                    break
+                if raw_target.startswith(old_prefix + os.sep):
+                    new_target = new_prefix + raw_target[len(old_prefix):]
+                    break
+            if new_target != raw_target:
+                os.unlink(full_path)
+                os.symlink(new_target, full_path)
+                count += 1
+    return count
+
+
+def _handle_profile_rename(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
+    src_name = validate_profile_name(str(params.get("source") or ""))
+    dst_name = validate_profile_name(str(params.get("target") or ""))
+    if src_name == dst_name:
+        raise ToolError(
+            "invalid_argument",
+            "Source and target profile names must differ.",
+            "Choose a distinct target profile name.",
+        )
+
+    src_dir, src_manifest = load_manifest(ctx.root, src_name)
+    dst_dir = get_profile_dir(ctx.root, dst_name)
+    if dst_dir.exists() or dst_dir.is_symlink():
+        raise ToolError(
+            "profile_exists",
+            "Target profile {!r} already exists.".format(dst_name),
+            "Choose an unused target profile name.",
+            {"target": dst_name},
+            http_status=409,
+        )
+
+    restart = bool(params.get("restart", False))
+    ps_rows = list_all_processes()
+    running_targets: List[str] = []
+    for tgt in ("hub", "ide"):
+        state = inspect_locks(src_dir, tgt, ps_rows=ps_rows)
+        if state["state"] == "running":
+            running_targets.append(tgt)
+
+    if running_targets and not restart:
+        raise ToolError(
+            "profile_running",
+            "Cannot rename profile {!r} while {} is running.".format(
+                src_name, ", ".join(running_targets)
+            ),
+            "Stop the profile first or pass restart=true (--restart).",
+            {"source": src_name, "running_targets": running_targets},
+        )
+    if running_targets and restart:
+        stop_profile(ctx.root, src_dir, target="all")
+
+    launcher_dest = _default_launcher_dest(ctx)
+    had_launchers = [
+        tgt
+        for tgt in ("hub", "ide")
+        if resolve_launcher_bundle_path(src_name, src_manifest.label, tgt, dest_dir=launcher_dest).exists()
+    ]
+    for tgt in ("hub", "ide"):
+        remove_launcher(src_name, src_manifest.label, tgt, dest_dir=launcher_dest)
+
+    os.replace(str(src_dir), str(dst_dir))
+    _retarget_internal_symlinks(src_dir, dst_dir)
+
+    for run_file in (dst_dir / "run.hub.json", dst_dir / "run.ide.json"):
+        if run_file.exists():
+            run_file.unlink()
+    for tgt in ("hub", "ide"):
+        repair_locks(ctx.root, dst_dir, target=tgt, allow_live_noop=True)
+
+    raw_label = params.get("label")
+    if raw_label is not None and str(raw_label).strip():
+        new_label = str(raw_label).strip()
+    else:
+        acct_email = detect_profile_account(dst_dir).get("email")
+        if acct_email and src_manifest.label.strip().lower() in (
+            src_name.lower(),
+            src_name.replace("-", " ").lower(),
+        ):
+            new_label = str(acct_email)
+        else:
+            new_label = src_manifest.label
+
+    src_manifest.name = dst_name
+    src_manifest.label = new_label
+    provision_profile_dirs(ctx.root, src_manifest, real_home=ctx.real_home)
+    save_manifest(ctx.root, dst_dir, src_manifest)
+
+    cli_bin = _resolve_cli_bin(ctx)
+    for tgt in had_launchers:
+        build_launcher(
+            profile_name=dst_name,
+            label=new_label,
+            target=tgt,
+            cli_bin_path=cli_bin,
+            dest_dir=launcher_dest,
+            root=ctx.root,
+        )
+
+    if restart:
+        for tgt in (running_targets or [src_manifest.default_target]):
+            launch_profile(
+                ctx.root,
+                dst_dir,
+                src_manifest,
+                target=tgt,
+                real_home=ctx.real_home,
+            )
+
+    inspected = _handle_profile_inspect(ctx, {"name": dst_name})
+    inspected["renamed_from"] = src_name
+    inspected["restarted"] = restart
+    return inspected
 
 
 def _safe_unlink_and_rmtree(root: Path, profile_dir: Path) -> None:
@@ -593,9 +1022,10 @@ def _handle_profile_delete(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[
             )
         stop_profile(ctx.root, profile_dir, target="all")
 
+    launcher_dest = _default_launcher_dest(ctx)
     removed_launchers: List[str] = []
     for tgt in ("hub", "ide"):
-        res = remove_launcher(name, manifest.label, tgt)
+        res = remove_launcher(name, manifest.label, tgt, dest_dir=launcher_dest)
         if res["removed"]:
             removed_launchers.append(res["bundle_path"])
 
@@ -612,7 +1042,7 @@ def _handle_launcher_build(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[
     _, manifest = load_manifest(ctx.root, name)
     target = validate_target(str(params.get("target") or manifest.default_target))
     dest = params.get("dest")
-    dest_path = Path(str(dest)).expanduser() if dest else None
+    dest_path = Path(str(dest)).expanduser() if dest else _default_launcher_dest(ctx)
     cli_bin = _resolve_cli_bin(ctx)
     return build_launcher(
         profile_name=name,
@@ -629,8 +1059,314 @@ def _handle_launcher_remove(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict
     _, manifest = load_manifest(ctx.root, name)
     target = validate_target(str(params.get("target") or manifest.default_target))
     dest = params.get("dest")
-    dest_path = Path(str(dest)).expanduser() if dest else None
+    dest_path = Path(str(dest)).expanduser() if dest else _default_launcher_dest(ctx)
     return remove_launcher(name, manifest.label, target, dest_dir=dest_path)
+
+
+def _inspect_git_dirty(workspace: Optional[str]) -> Dict[str, Any]:
+    """Check git working tree cleanliness read-only without blocking or failing."""
+    if not workspace:
+        return {"workspace": None, "is_git": False, "dirty": False, "modified_count": 0}
+    ws_path = Path(workspace).expanduser()
+    if not ws_path.is_dir() or not shutil.which("git"):
+        return {"workspace": str(ws_path), "is_git": False, "dirty": False, "modified_count": 0}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(ws_path), "status", "--porcelain", "--untracked-files=normal"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"workspace": str(ws_path), "is_git": False, "dirty": False, "modified_count": 0}
+    if proc.returncode != 0:
+        return {"workspace": str(ws_path), "is_git": False, "dirty": False, "modified_count": 0}
+    changed = [line for line in proc.stdout.splitlines() if line.strip()]
+    return {
+        "workspace": str(ws_path),
+        "is_git": True,
+        "dirty": len(changed) > 0,
+        "modified_count": len(changed),
+    }
+
+
+def _copy_prompt_to_clipboard(prompt_text: str, copy_prompt: bool) -> bool:
+    if not (copy_prompt and prompt_text and sys.platform == "darwin" and Path("/usr/bin/pbcopy").exists()):
+        return False
+    try:
+        cp_proc = subprocess.run(
+            ["/usr/bin/pbcopy"],
+            input=prompt_text,
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+        return cp_proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _handle_switch_to_host(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
+    raw_from = str(params.get("from_source") or "").strip()
+    if not raw_from or raw_from.lower() == "host":
+        raise ToolError(
+            "invalid_argument",
+            "Returning quota to Host requires a backup profile in from_source.",
+            "Pass --from <profile> when switching back to host.",
+        )
+    src_name = validate_profile_name(raw_from)
+    src_dir, src_manifest = load_manifest(ctx.root, src_name)
+    copy_prompt = bool(params.get("copy_prompt", False))
+    launch = bool(params.get("launch", True))
+    include_sessions = bool(params.get("include_sessions", True))
+    session_limit = _parse_session_limit(params)
+    limit = _parse_handoff_limit(params)
+    explicit_ws = str(params.get("workspace") or "").strip() or None
+
+    handoff_digest = _handle_host_handoff(ctx, {"limit": limit, "source": src_manifest.name})
+    check_ws = explicit_ws
+    if not check_ws:
+        for item in handoff_digest.get("conversations") or []:
+            cand_ws = str(item.get("workspace") or "").strip()
+            if cand_ws and Path(cand_ws).is_dir():
+                check_ws = cand_ws
+                break
+    git_status = _inspect_git_dirty(check_ws)
+
+    ps_before = list_all_processes()
+    running_targets = [
+        tgt
+        for tgt in ("hub", "ide")
+        if inspect_locks(src_dir, tgt, ps_rows=ps_before)["state"] == "running"
+    ]
+    stop_res: Optional[Dict[str, Any]] = None
+    relaunch_results: List[Dict[str, Any]] = []
+    if launch and running_targets:
+        stop_res = stop_profile(ctx.root, src_dir, target="all")
+
+    src_gemini_dir = ensure_within_root(src_dir, src_dir / "home" / ".gemini")
+    src_acct = detect_profile_account(src_dir).get("email") or src_manifest.label
+    handoff_written = write_host_handoff_context(
+        src_gemini_dir,
+        src_acct,
+        src_manifest.name,
+        real_home=ctx.real_home,
+        limit=limit,
+    )
+
+    host_home = (ctx.real_home if ctx.real_home is not None else Path.home()).resolve()
+    host_rt_now = inspect_host_runtime(real_home=ctx.real_home, ps_rows=ps_before)
+    host_now_running = (
+        host_rt_now["hub"]["state"] == "running" or host_rt_now["ide"]["state"] == "running"
+    )
+    sessions_returned: Dict[str, Any] = {
+        "synced_sessions": 0,
+        "skipped_up_to_date": 0,
+        "total_dst_sessions": 0,
+        "worktrees_linked": 0,
+        "proto_rebuilt": False,
+    }
+    if include_sessions:
+        sessions_returned = sync_conversation_sessions(
+            src_gemini=src_gemini_dir,
+            dst_gemini=ensure_within_root(host_home, host_home / ".gemini"),
+            dst_root_bound=host_home,
+            host_home=host_home,
+            limit=session_limit,
+            skip_locked_on_dst=True,
+            rebuild_proto=(not host_now_running),
+        )
+
+    provision_profile_dirs(ctx.root, src_manifest, real_home=ctx.real_home)
+    sync_res = sync_host_customizations(
+        src_dir,
+        real_home=ctx.real_home,
+        automations_mode="paused",
+        include_handoff=False,
+        include_sessions=False,
+    )
+    host_restored = restore_host_automations(real_home=ctx.real_home)
+
+    if launch and running_targets:
+        for tgt in running_targets:
+            relaunch_results.append(
+                launch_profile(
+                    ctx.root,
+                    src_dir,
+                    src_manifest,
+                    target=tgt,
+                    real_home=ctx.real_home,
+                )
+            )
+
+    prompt_text = str(handoff_digest.get("resume_prompt") or "")
+    prompt_copied = _copy_prompt_to_clipboard(prompt_text, copy_prompt)
+
+    overview = _handle_profile_list(ctx, {})
+    backup_summary = next(
+        (p for p in overview["profiles"] if p["manifest"]["name"] == src_manifest.name),
+        None,
+    )
+    ev = EvidenceRecord(
+        operation="profile_switch_host",
+        authority="filesystem",
+        confidence="observed",
+        summary=(
+            "Returned quota from '{}' to Host ({} conversations indexed, backup automations paused)."
+        ).format(src_manifest.name, handoff_written.get("count", 0)),
+        facts={
+            "target_profile": "host",
+            "from_source": src_manifest.name,
+            "handoff_written": bool(handoff_written.get("written")),
+            "handoff_count": int(handoff_written.get("count") or 0),
+            "backup_automations_enabled": int(sync_res.get("automations_enabled") or 0),
+            "git_dirty": git_status["dirty"],
+            "git_modified_count": git_status["modified_count"],
+            "prompt_copied": prompt_copied,
+        },
+        limitations=[],
+    )
+    return {
+        "target_profile": "host",
+        "from_source": src_manifest.name,
+        "handoff": handoff_written,
+        "sessions": sessions_returned,
+        "sync": sync_res,
+        "stop": stop_res,
+        "backup_profile": backup_summary,
+        "host_account": overview["host_account"],
+        "host_runtime": overview["host_runtime"],
+        "flow": overview["flow"],
+        "switch": {
+            "target": "hub",
+            "automations_mode": "paused",
+            "from_source": src_manifest.name,
+            "git_status": git_status,
+            "prompt_copied": prompt_copied,
+            "resume_prompt": prompt_text,
+            "relaunched_backup": relaunch_results,
+            "host_automations_restored": host_restored,
+        },
+        "evidence": ev.to_dict(),
+    }
+
+
+def _handle_profile_switch(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
+    raw_name = str(params.get("name") or "").strip()
+    if raw_name.lower() == "host":
+        return _handle_switch_to_host(ctx, params)
+    name = validate_profile_name(raw_name)
+    profile_dir, manifest = load_manifest(ctx.root, name)
+    mode = validate_automations_mode(str(params.get("automations_mode") or "active"))
+    chosen_target = validate_target(str(params.get("target") or manifest.default_target))
+    raw_from = str(params.get("from_source") or "host").strip() or "host"
+    from_source = "host" if raw_from == name else raw_from
+    copy_prompt = bool(params.get("copy_prompt", False))
+    launch = bool(params.get("launch", True))
+    include_sessions = bool(params.get("include_sessions", True))
+    session_limit = _parse_session_limit(params)
+    limit = _parse_handoff_limit(params)
+    explicit_ws = str(params.get("workspace") or "").strip() or None
+
+    handoff_digest = _handle_host_handoff(ctx, {"limit": limit, "source": from_source})
+    check_ws = explicit_ws
+    if not check_ws:
+        for item in handoff_digest.get("conversations") or []:
+            cand_ws = str(item.get("workspace") or "").strip()
+            if cand_ws and Path(cand_ws).is_dir():
+                check_ws = cand_ws
+                break
+    git_status = _inspect_git_dirty(check_ws)
+
+    source_name, source_gemini, source_account = _resolve_handoff_source(ctx, from_source)
+    stop_res: Optional[Dict[str, Any]] = None
+    launch_res: Optional[Dict[str, Any]] = None
+    if launch:
+        stop_res = stop_profile(ctx.root, profile_dir, target="all")
+
+    host_paused: Dict[str, Any] = {"paused_count": 0, "paused_ids": []}
+    if mode == "active":
+        host_paused = pause_host_automations(real_home=ctx.real_home)
+
+    provision_profile_dirs(ctx.root, manifest, real_home=ctx.real_home)
+    sync_res = sync_host_customizations(
+        profile_dir,
+        real_home=ctx.real_home,
+        automations_mode=mode,
+        include_handoff=True,
+        handoff_limit=limit,
+        handoff_source_gemini=source_gemini,
+        handoff_source_account=source_account,
+        handoff_source_name=source_name,
+        include_sessions=include_sessions,
+        session_limit=session_limit,
+        turbo_bypass=True,
+    )
+
+    if launch:
+        launch_ws = explicit_ws or (check_ws if chosen_target == "ide" and check_ws else None)
+        launch_res = launch_profile(
+            ctx.root,
+            profile_dir,
+            manifest,
+            target=chosen_target,
+            workspace=launch_ws,
+            real_home=ctx.real_home,
+        )
+
+    prompt_text = str(handoff_digest.get("resume_prompt") or "")
+    prompt_copied = _copy_prompt_to_clipboard(prompt_text, copy_prompt)
+
+    ps_rows = list_all_processes()
+    summary = _build_profile_summary(
+        ctx.root,
+        profile_dir,
+        manifest,
+        ps_rows,
+        launcher_dest=_default_launcher_dest(ctx),
+    )
+    ev = EvidenceRecord(
+        operation="profile_switch",
+        authority="filesystem",
+        confidence="observed",
+        summary="Switched to '{}' (automations={}, synced {} projects, {} automations active, launch={}).".format(
+            manifest.name,
+            mode,
+            sync_res["projects_synced"],
+            sync_res["automations_enabled"],
+            launch,
+        ),
+        facts={
+            "profile": manifest.name,
+            "target": chosen_target,
+            "automations_mode": mode,
+            "automations_synced": sync_res["automations_synced"],
+            "automations_enabled": sync_res["automations_enabled"],
+            "from_source": source_name,
+            "git_dirty": git_status["dirty"],
+            "git_modified_count": git_status["modified_count"],
+            "prompt_copied": prompt_copied,
+            "launched": launch,
+        },
+        limitations=[],
+    )
+    summary["sync"] = sync_res
+    summary["stop"] = stop_res
+    summary["switch"] = {
+        "target": chosen_target,
+        "automations_mode": mode,
+        "from_source": source_name,
+        "git_status": git_status,
+        "prompt_copied": prompt_copied,
+        "resume_prompt": prompt_text,
+        "launched": launch_res,
+        "host_automations_paused": host_paused,
+    }
+    summary["evidence"] = ev.to_dict()
+    return summary
 
 
 def _handle_system_doctor(ctx: RuntimeContext, _params: Dict[str, Any]) -> Dict[str, Any]:
@@ -642,6 +1378,8 @@ def _handle_system_doctor(ctx: RuntimeContext, _params: Dict[str, Any]) -> Dict[
     ps_rows = list_all_processes()
     stale_profiles: List[str] = []
     insecure_profiles: List[str] = []
+    unsigned_launchers: List[str] = []
+    launcher_dest = _default_launcher_dest(ctx)
     profile_count = 0
     if root_exists:
         for entry in sorted(ctx.root.iterdir(), key=lambda p: p.name.lower()):
@@ -652,6 +1390,14 @@ def _handle_system_doctor(ctx: RuntimeContext, _params: Dict[str, Any]) -> Dict[
             for tgt in ("hub", "ide"):
                 if inspect_locks(entry, tgt, ps_rows=ps_rows)["state"] == "stale-lock":
                     stale_profiles.append("{}:{}".format(entry.name, tgt))
+                bundle = resolve_launcher_bundle_path(
+                    manifest.name,
+                    manifest.label,
+                    tgt,
+                    dest_dir=launcher_dest,
+                )
+                if bundle.exists() and not verify_launcher_signature(bundle):
+                    unsigned_launchers.append("{}:{}".format(entry.name, tgt))
             iso = audit_profile_isolation(entry, manifest)
             if iso["forbidden_symlinks_present"] or not iso["zshenv_home_locked"]:
                 insecure_profiles.append(entry.name)
@@ -681,6 +1427,11 @@ def _handle_system_doctor(ctx: RuntimeContext, _params: Dict[str, Any]) -> Dict[
             "id": "osacompile",
             "status": "pass" if osacompile_path else "warn",
             "detail": osacompile_path or "Unavailable on non-macOS host",
+        },
+        {
+            "id": "launcher_signatures",
+            "status": "warn" if unsigned_launchers else "pass",
+            "detail": ", ".join(unsigned_launchers) if unsigned_launchers else "Compiled .app launchers carry valid signatures",
         },
         {
             "id": "stale_locks",
@@ -1095,11 +1846,29 @@ TOOL_SPECS: List[ToolSpec] = [
                 "source": {"type": "string"},
                 "target": {"type": "string"},
                 "label": {"type": "string"},
+                "fresh_auth": {"type": "boolean", "default": False},
             },
             "required": ["source", "target"],
             "additionalProperties": False,
         },
         handler=_handle_profile_clone,
+        mutates=True,
+    ),
+    ToolSpec(
+        name="profile_rename",
+        description="Rename a sandbox profile slug and display label while preserving login credentials and relocking .zshenv HOME.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "source": {"type": "string"},
+                "target": {"type": "string"},
+                "label": {"type": "string"},
+                "restart": {"type": "boolean", "default": False},
+            },
+            "required": ["source", "target"],
+            "additionalProperties": False,
+        },
+        handler=_handle_profile_rename,
         mutates=True,
     ),
     ToolSpec(
@@ -1152,13 +1921,17 @@ TOOL_SPECS: List[ToolSpec] = [
     ),
     ToolSpec(
         name="profile_sync",
-        description="Sync sanitized host projects, plugins, agents, skills, rules, MCP JSON, and optional handoff context into a profile.",
+        description="Sync sanitized host projects, automations, plugins, agents, skills, rules, MCP JSON, optional clickable sidebar sessions, and handoff into a profile.",
         input_schema={
             "type": "object",
             "properties": {
                 "name": {"type": "string"},
                 "include_sidecars": {"type": "boolean", "default": False},
+                "automations_mode": {"type": "string", "enum": ["paused", "active", "strip"]},
                 "include_handoff": {"type": "boolean", "default": True},
+                "include_sessions": {"type": "boolean", "default": False},
+                "session_limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+                "from_source": {"type": "string", "default": "host"},
                 "restart": {"type": "boolean", "default": False},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10},
             },
@@ -1169,12 +1942,36 @@ TOOL_SPECS: List[ToolSpec] = [
         mutates=True,
     ),
     ToolSpec(
+        name="profile_switch",
+        description="Switch active quota onto a profile (or back to 'host') by checking git status, syncing clickable sidebar sessions, setup, handoff, and automations, and launching.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "automations_mode": {"type": "string", "enum": ["paused", "active", "strip"], "default": "active"},
+                "target": {"type": "string", "enum": ["hub", "ide"]},
+                "workspace": {"type": "string"},
+                "from_source": {"type": "string", "default": "host"},
+                "include_sessions": {"type": "boolean", "default": True},
+                "session_limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+                "copy_prompt": {"type": "boolean", "default": False},
+                "launch": {"type": "boolean", "default": True},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+        handler=_handle_profile_switch,
+        mutates=True,
+    ),
+    ToolSpec(
         name="host_handoff",
-        description="Read active host Antigravity conversations read-only to generate a resume digest.",
+        description="Read active Host or sandbox Antigravity conversations read-only to generate a resume digest.",
         input_schema={
             "type": "object",
             "properties": {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10},
+                "source": {"type": "string", "default": "host"},
             },
             "additionalProperties": False,
         },
@@ -1183,7 +1980,7 @@ TOOL_SPECS: List[ToolSpec] = [
     ),
     ToolSpec(
         name="system_doctor",
-        description="Inspect host Antigravity bundles, sandbox root permissions, stale locks, and isolation state.",
+        description="Inspect host Antigravity bundles, sandbox root permissions, launcher signatures, stale locks, and isolation state.",
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         handler=_handle_system_doctor,
         mutates=False,
@@ -1224,4 +2021,10 @@ def call_tool(name: str, params: Optional[Dict[str, Any]], ctx: RuntimeContext) 
             http_status=404,
         )
     args = params if isinstance(params, dict) else {}
-    return spec.handler(ctx, args)
+    if spec.mutates:
+        invalidate_disk_size_cache()
+    try:
+        return spec.handler(ctx, args)
+    finally:
+        if spec.mutates:
+            invalidate_disk_size_cache()

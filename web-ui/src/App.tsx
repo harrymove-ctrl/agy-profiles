@@ -3,27 +3,41 @@ import { AppShell } from "@astryxdesign/core/AppShell";
 import { Theme } from "@astryxdesign/core/theme";
 import { ToastViewport, useToast } from "@astryxdesign/core/Toast";
 import { defaultThemeSlug, themes, type ThemeSlug } from "./astryx-themes";
-import { ApiClientError, apiFetch, stripBootstrapTokenFromUrl } from "./api";
+import {
+  ApiClientError,
+  apiFetch,
+  pluralize,
+  stripBootstrapTokenFromUrl,
+} from "./api";
 import { DoctorStage } from "./components/DoctorStage";
+import { HandoffStage } from "./components/HandoffStage";
 import { ObligationsStage } from "./components/ObligationsStage";
 import {
   CloneProfileDrawer,
   CreateProfileDrawer,
+  RenameProfileDrawer,
 } from "./components/ProfileDialogs";
 import {
+  HOST_SELECTION_ID,
   ProfilesDetailPane,
   ProfilesSideRail,
 } from "./components/ProfilesWorkspace";
 import { TopBar } from "./components/TopBar";
 import type {
   AppView,
+  AutomationsMode,
   CloneProfilePayload,
   CreateProfilePayload,
   DoctorResponse,
+  HandoffResponse,
   ObligationsResponse,
   OverviewResponse,
   ProfileDetail,
   ProfileFilter,
+  RenameProfilePayload,
+  ReturnHostSwitchResponse,
+  SwitchProfileResponse,
+  SyncProfileResponse,
   TargetKind,
   UpdateProfilePayload,
 } from "./types";
@@ -86,11 +100,19 @@ function ConsoleShell({
 
   const [createOpen, setCreateOpen] = useState(false);
   const [cloneOpen, setCloneOpen] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
 
   const [obligations, setObligations] = useState<ObligationsResponse | null>(null);
   const [obligationsLoading, setObligationsLoading] = useState(false);
   const [doctor, setDoctor] = useState<DoctorResponse | null>(null);
   const [doctorLoading, setDoctorLoading] = useState(false);
+  const [handoff, setHandoff] = useState<HandoffResponse | null>(null);
+  const [handoffLoading, setHandoffLoading] = useState(false);
+  const [handoffSource, setHandoffSource] = useState<string>("host");
+  const [syncBusy, setSyncBusy] = useState<string | null>(null);
+  const [handoffError, setHandoffError] = useState<string | null>(null);
+  const [handoffTarget, setHandoffTarget] = useState<string | null>(null);
+  const lastVisibilityRefreshRef = useRef<number>(0);
 
   const reportError = useCallback(
     (err: unknown, fallback: string) => {
@@ -134,11 +156,21 @@ function ConsoleShell({
 
         const names = data.profiles.map((p) => p.manifest.name);
         let nextSelected = preferredName ?? selectedName;
+        if (nextSelected === HOST_SELECTION_ID) {
+          setSelectedName(HOST_SELECTION_ID);
+          setDetail(null);
+          return;
+        }
+        if (names.length === 0) {
+          setSelectedName(HOST_SELECTION_ID);
+          setDetail(null);
+          return;
+        }
         if (!nextSelected || !names.includes(nextSelected)) {
-          nextSelected = names[0] ?? null;
+          nextSelected = names[0] ?? HOST_SELECTION_ID;
         }
         setSelectedName(nextSelected);
-        if (nextSelected) {
+        if (nextSelected && nextSelected !== HOST_SELECTION_ID) {
           await loadDetail(nextSelected);
         } else {
           setDetail(null);
@@ -181,16 +213,222 @@ function ConsoleShell({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const loadHandoff = useCallback(
+    async (sourceOverride?: string) => {
+      const effectiveSource = sourceOverride ?? handoffSource;
+      setHandoffLoading(true);
+      setHandoffError(null);
+      try {
+        const data = await apiFetch<HandoffResponse>(
+          `/api/handoff?limit=10&source=${encodeURIComponent(effectiveSource)}`
+        );
+        setHandoff(data);
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : "Failed to load conversation handoff.";
+        setHandoffError(msg);
+        reportError(err, "Failed to load conversation handoff.");
+      } finally {
+        setHandoffLoading(false);
+      }
+    },
+    [handoffSource, reportError]
+  );
+
+  const handleSelectHandoffSource = useCallback(
+    (nextSource: string) => {
+      setHandoffSource(nextSource);
+      void loadHandoff(nextSource);
+    },
+    [loadHandoff]
+  );
+
+  const handleSyncProfile = useCallback(
+    async (
+      name: string,
+      restart: boolean,
+      automationsMode: AutomationsMode = "paused"
+    ) => {
+      setSyncBusy("sync");
+      setHandoffError(null);
+      const fromSrc = handoffSource === name ? "host" : handoffSource;
+      try {
+        const res = await apiFetch<SyncProfileResponse>(
+          `/api/profiles/${encodeURIComponent(name)}/sync`,
+          {
+            method: "POST",
+            body: {
+              restart,
+              include_handoff: true,
+              include_sessions: true,
+              automations_mode: automationsMode,
+              from_source: fromSrc,
+            },
+          }
+        );
+        const autoCount = res.sync.automations_synced ?? 0;
+        const autoEnabled = res.sync.automations_enabled ?? 0;
+        const totalSessions = res.sync.sync_state.sessions_count ?? 0;
+        const autoState =
+          automationsMode === "strip"
+            ? "stripped"
+            : autoEnabled > 0
+              ? `${autoEnabled} active`
+              : "paused";
+        toast({
+          body: `Synced ${pluralize(
+            res.sync.projects_synced,
+            "project"
+          )}, ${pluralize(totalSessions, "session")}, and ${pluralize(
+            autoCount,
+            "automation"
+          )} (${autoState}) into ${name}.`,
+          type: "info",
+        });
+        await refreshState(name);
+        if (handoff) {
+          void loadHandoff();
+        }
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : "Failed to sync profile setup.";
+        setHandoffError(msg);
+        reportError(err, "Failed to sync profile setup.");
+      } finally {
+        setSyncBusy(null);
+      }
+    },
+    [handoff, handoffSource, loadHandoff, refreshState, reportError, toast]
+  );
+
+  const handleSwitchProfile = useCallback(
+    async (name: string) => {
+      setSyncBusy("switch");
+      setHandoffError(null);
+      const fromSrc = handoffSource === name ? "host" : handoffSource;
+      try {
+        const res = await apiFetch<SwitchProfileResponse>(
+          `/api/profiles/${encodeURIComponent(name)}/switch`,
+          {
+            method: "POST",
+            body: {
+              automations_mode: "active",
+              from_source: fromSrc,
+              include_sessions: true,
+              copy_prompt: true,
+              launch: true,
+            },
+          }
+        );
+        const enabled = res.sync.automations_enabled ?? 0;
+        const totalSessions = res.sync.sync_state.sessions_count ?? 0;
+        toast({
+          body: `Switched quota onto ${name} (${pluralize(
+            totalSessions,
+            "clickable session"
+          )}, ${pluralize(enabled, "automation")} active${
+            res.switch.prompt_copied ? ", prompt copied" : ""
+          }).`,
+          type: "info",
+        });
+        if (res.switch.git_status?.dirty) {
+          toast({
+            body: `Uncommitted edits detected in ${res.switch.git_status.workspace} (${res.switch.git_status.modified_count} modified).`,
+            type: "info",
+          });
+        }
+        await refreshState(name);
+        if (handoff) {
+          void loadHandoff();
+        }
+      } catch (err) {
+        reportError(err, `Failed to switch quota onto ${name}.`);
+      } finally {
+        setSyncBusy(null);
+      }
+    },
+    [handoff, handoffSource, loadHandoff, refreshState, reportError, toast]
+  );
+
+  const handleReturnToHost = useCallback(
+    async (fromProfile: string) => {
+      setSyncBusy("return-host");
+      setHandoffError(null);
+      try {
+        const res = await apiFetch<ReturnHostSwitchResponse>(
+          "/api/profiles/host/switch",
+          {
+            method: "POST",
+            body: {
+              from_source: fromProfile,
+              include_sessions: true,
+              copy_prompt: true,
+              launch: true,
+            },
+          }
+        );
+        const hostEmail = res.host_account?.email ?? "Main Antigravity";
+        const mergedCount = res.sessions?.synced_sessions ?? 0;
+        toast({
+          body: `Returned quota to ${hostEmail} (${pluralize(
+            mergedCount,
+            "session"
+          )} merged, ${fromProfile} automations paused${
+            res.switch.prompt_copied ? ", prompt copied" : ""
+          }).`,
+          type: "info",
+        });
+        if (res.switch.git_status?.dirty) {
+          toast({
+            body: `Uncommitted edits detected in ${res.switch.git_status.workspace} (${res.switch.git_status.modified_count} modified).`,
+            type: "info",
+          });
+        }
+        await refreshState();
+        if (handoff) {
+          void loadHandoff();
+        }
+      } catch (err) {
+        reportError(err, `Failed to return quota from ${fromProfile} to Host.`);
+      } finally {
+        setSyncBusy(null);
+      }
+    },
+    [handoff, loadHandoff, refreshState, reportError, toast]
+  );
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastVisibilityRefreshRef.current < 3000) {
+        return;
+      }
+      lastVisibilityRefreshRef.current = now;
+      if (view === "profiles") {
+        void refreshState();
+      } else if (view === "handoff") {
+        void loadHandoff();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [loadHandoff, refreshState, view]);
+
   const handleViewChange = useCallback(
     (next: AppView) => {
       setView(next);
-      if (next === "obligations" && !obligations) {
+      if (next === "handoff" && !handoff) {
+        void loadHandoff();
+      } else if (next === "obligations" && !obligations) {
         void loadObligations();
       } else if (next === "doctor" && !doctor) {
         void loadDoctor();
       }
     },
-    [doctor, loadDoctor, loadObligations, obligations]
+    [doctor, handoff, loadDoctor, loadHandoff, loadObligations, obligations]
   );
 
   useEffect(() => {
@@ -215,6 +453,7 @@ function ConsoleShell({
         event.altKey ||
         createOpen ||
         cloneOpen ||
+        renameOpen ||
         confirmDeleteOpen
       ) {
         return;
@@ -243,6 +482,8 @@ function ConsoleShell({
         event.preventDefault();
         if (view === "profiles") {
           void refreshState();
+        } else if (view === "handoff") {
+          void loadHandoff();
         } else if (view === "obligations") {
           void loadObligations();
         } else {
@@ -260,12 +501,22 @@ function ConsoleShell({
     loadDoctor,
     loadObligations,
     refreshState,
+    renameOpen,
     view,
   ]);
+
+  const handleSelectHost = useCallback(() => {
+    setConfirmDeleteOpen(false);
+    setSelectedName(HOST_SELECTION_ID);
+  }, []);
 
   const handleSelectProfile = useCallback(
     (name: string) => {
       setConfirmDeleteOpen(false);
+      if (name === HOST_SELECTION_ID) {
+        setSelectedName(HOST_SELECTION_ID);
+        return;
+      }
       setSelectedName(name);
       void loadDetail(name);
     },
@@ -300,6 +551,24 @@ function ConsoleShell({
       type: "info",
     });
     await refreshState(cloned.manifest.name);
+  };
+
+  const handleRenameProfile = async (
+    source: string,
+    payload: RenameProfilePayload
+  ) => {
+    const renamed = await apiFetch<ProfileDetail>(
+      `/api/profiles/${encodeURIComponent(source)}/rename`,
+      {
+        method: "POST",
+        body: payload,
+      }
+    );
+    toast({
+      body: `Renamed ${source} to ${renamed.manifest.name}.`,
+      type: "info",
+    });
+    await refreshState(renamed.manifest.name);
   };
 
   const handleLaunch = async (name: string, target: TargetKind) => {
@@ -447,6 +716,8 @@ function ConsoleShell({
             view={view}
             profileCount={profiles.length}
             targets={targets}
+            hostAccount={overview?.host_account ?? null}
+            hostRuntime={overview?.host_runtime ?? null}
             themeSlug={themeSlug}
             isDarkOnlyTheme={isDarkOnlyTheme}
             resolvedMode={resolvedMode}
@@ -460,12 +731,15 @@ function ConsoleShell({
           view === "profiles" ? (
             <ProfilesSideRail
               profiles={profiles}
+              hostAccount={overview?.host_account ?? null}
+              hostRuntime={overview?.host_runtime ?? null}
               selectedName={selectedName}
               searchQuery={searchQuery}
               runtimeFilter={runtimeFilter}
               searchInputRef={searchInputRef}
               onSearchChange={setSearchQuery}
               onRuntimeFilterChange={setRuntimeFilter}
+              onSelectHost={handleSelectHost}
               onSelectProfile={handleSelectProfile}
             />
           ) : undefined
@@ -474,6 +748,16 @@ function ConsoleShell({
       >
         {view === "profiles" ? (
           <ProfilesDetailPane
+            selectedName={selectedName}
+            hostAccount={overview?.host_account ?? null}
+            hostRuntime={overview?.host_runtime ?? null}
+            flow={overview?.flow ?? null}
+            syncBusy={syncBusy}
+            onSelectHost={handleSelectHost}
+            onSync={handleSyncProfile}
+            onSwitch={handleSwitchProfile}
+            onReturnHost={handleReturnToHost}
+            onOpenHandoff={() => handleViewChange("handoff")}
             profiles={profiles}
             detail={detail}
             targets={targets}
@@ -483,12 +767,32 @@ function ConsoleShell({
             onConfirmDeleteOpenChange={setConfirmDeleteOpen}
             onOpenCreate={() => setCreateOpen(true)}
             onOpenClone={() => setCloneOpen(true)}
+            onOpenRename={() => setRenameOpen(true)}
             onLaunch={handleLaunch}
             onStop={handleStop}
             onRepair={handleRepair}
             onToggleLauncher={handleToggleLauncher}
             onSavePolicy={handleSavePolicy}
             onDeleteProfile={handleDeleteProfile}
+          />
+        ) : view === "handoff" ? (
+          <HandoffStage
+            handoff={handoff}
+            hostAccount={overview?.host_account ?? null}
+            hostRuntime={overview?.host_runtime ?? null}
+            profiles={profiles}
+            selectedSource={handoffSource}
+            selectedProfile={handoffTarget}
+            loading={handoffLoading}
+            syncBusy={syncBusy}
+            errorMessage={handoffError}
+            onRefresh={() => void loadHandoff()}
+            onSelectSource={handleSelectHandoffSource}
+            onSelectProfile={setHandoffTarget}
+            onSyncProfile={handleSyncProfile}
+            onSwitchProfile={handleSwitchProfile}
+            onReturnHost={handleReturnToHost}
+            onOpenCreate={() => setCreateOpen(true)}
           />
         ) : view === "obligations" ? (
           <ObligationsStage
@@ -517,6 +821,21 @@ function ConsoleShell({
         isOpen={cloneOpen}
         onOpenChange={setCloneOpen}
         onClone={handleCloneProfile}
+      />
+
+      <RenameProfileDrawer
+        sourceName={detail?.manifest.name ?? null}
+        sourceLabel={detail?.manifest.label ?? null}
+        detectedEmail={detail?.account?.email ?? null}
+        isRunning={
+          detail
+            ? detail.runtime.hub.state === "running" ||
+              detail.runtime.ide.state === "running"
+            : false
+        }
+        isOpen={renameOpen}
+        onOpenChange={setRenameOpen}
+        onRename={handleRenameProfile}
       />
     </>
   );

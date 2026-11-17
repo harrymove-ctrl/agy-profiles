@@ -40,7 +40,41 @@ export const THEME_OPTIONS: ThemeOption[] = [
   },
 ];
 
+const INITIAL_URL_PARAMS =
+  typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
+const INITIAL_BOOT_TOKEN = INITIAL_URL_PARAMS?.get("token") ?? "";
+const IS_EMBEDDED_SIDECAR =
+  typeof window !== "undefined" &&
+  (Boolean(INITIAL_URL_PARAMS?.has("conversationId")) || window.parent !== window);
+
+export function isEmbeddedSidecar(): boolean {
+  return IS_EMBEDDED_SIDECAR;
+}
+
+export async function startSidecarConversation(
+  message: string,
+  title?: string
+): Promise<boolean> {
+  const bridge = (
+    window as unknown as {
+      sidecar?: {
+        agent?: {
+          startConversation?: (msg: string, title?: string) => Promise<unknown>;
+        };
+      };
+    }
+  ).sidecar;
+  if (!bridge?.agent?.startConversation) {
+    return false;
+  }
+  await bridge.agent.startConversation(message, title);
+  return true;
+}
+
 export function stripBootstrapTokenFromUrl(): void {
+  if (IS_EMBEDDED_SIDECAR) {
+    return;
+  }
   const params = new URLSearchParams(window.location.search);
   if (!params.has("token")) {
     return;
@@ -78,6 +112,9 @@ export async function apiFetch<T>(
   const headers: Record<string, string> = {
     "X-AGY-CSRF": getCsrfToken(),
   };
+  if (INITIAL_BOOT_TOKEN) {
+    headers["X-Sidecar-Token"] = INITIAL_BOOT_TOKEN;
+  }
   let payload: string | undefined;
   if (options?.body !== undefined) {
     headers["Content-Type"] = "application/json";
@@ -157,6 +194,21 @@ export function computeCombinedState(rt: {
 
 export function pluralize(count: number, singular: string, plural = `${singular}s`): string {
   return `${count} ${count === 1 ? singular : plural}`;
+}
+
+export function formatTargetPidSummary(rt: TargetRuntime): string {
+  if (rt.pids.length === 0) {
+    return pluralize(rt.lock_files.length, "lock");
+  }
+  const roots =
+    rt.root_pids && rt.root_pids.length > 0
+      ? rt.root_pids
+      : rt.pids.slice(0, 2);
+  const rootLabel = `PID ${roots.join(", ")}`;
+  if (rt.pids.length > roots.length) {
+    return `${rootLabel} · ${pluralize(rt.pids.length, "process", "processes")}`;
+  }
+  return rootLabel;
 }
 
 export function formatRuntimeState(state: RuntimeStateType): string {

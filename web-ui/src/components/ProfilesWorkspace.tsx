@@ -44,19 +44,28 @@ import {
   formatBytes,
   formatLinkPolicy,
   formatRuntimeState,
+  formatTargetPidSummary,
   pluralize,
 } from "../api";
+import { Token } from "@astryxdesign/core/Token";
 import type {
   AuthMode,
+  AutomationsMode,
+  HostAccountInfo,
+  HostRuntimeInfo,
   LinkPolicy,
   ProfileDetail,
   ProfileFilter,
   ProfileSummary,
+  QuotaFlowInfo,
   RuntimeStateType,
   TargetInfo,
   TargetKind,
+  TargetRuntime,
   UpdateProfilePayload,
 } from "../types";
+
+export const HOST_SELECTION_ID = "__host__";
 
 function runtimeDotVariant(state: RuntimeStateType): StatusDotVariant {
   if (state === "running") {
@@ -84,25 +93,38 @@ function renderRuntimeEndState(state: RuntimeStateType) {
 
 export interface ProfilesSideRailProps {
   profiles: ProfileSummary[];
+  hostAccount?: HostAccountInfo | null;
+  hostRuntime?: HostRuntimeInfo | null;
   selectedName: string | null;
   searchQuery: string;
   runtimeFilter: ProfileFilter;
   searchInputRef: RefObject<HTMLInputElement | null>;
   onSearchChange: (value: string) => void;
   onRuntimeFilterChange: (filter: ProfileFilter) => void;
+  onSelectHost: () => void;
   onSelectProfile: (name: string) => void;
 }
 
 export function ProfilesSideRail({
   profiles,
+  hostAccount = null,
+  hostRuntime = null,
   selectedName,
   searchQuery,
   runtimeFilter,
   searchInputRef,
   onSearchChange,
   onRuntimeFilterChange,
+  onSelectHost,
   onSelectProfile,
 }: ProfilesSideRailProps) {
+  const hostCombinedState: RuntimeStateType = hostRuntime
+    ? computeCombinedState(hostRuntime)
+    : "stopped";
+  const hostCronCount =
+    (hostRuntime?.hub.schedule_count ?? 0) +
+    (hostRuntime?.ide.schedule_count ?? 0);
+
   const filteredProfiles = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
     return profiles.filter((p) => {
@@ -116,6 +138,7 @@ export function ProfilesSideRail({
       return (
         p.manifest.name.toLowerCase().includes(query) ||
         p.manifest.label.toLowerCase().includes(query) ||
+        (p.account?.email ?? "").toLowerCase().includes(query) ||
         p.manifest.default_target.toLowerCase().includes(query) ||
         p.manifest.link_policy.toLowerCase().includes(query)
       );
@@ -124,12 +147,12 @@ export function ProfilesSideRail({
 
   return (
     <SideNav
-      aria-label="Sandbox profiles"
+      aria-label="Antigravity workspaces"
       resizable={{ defaultWidth: 300, minWidth: 240, maxWidth: 420 }}
       header={
         <SideNavHeading
           heading="Profiles"
-          subheading={`${profiles.length} provisioned`}
+          subheading={`Host + ${pluralize(profiles.length, "backup")}`}
         />
       }
       topContent={
@@ -160,19 +183,47 @@ export function ProfilesSideRail({
         </VStack>
       }
     >
-      <SideNavSection title="Provisioned Profiles" isHeaderHidden>
+      <SideNavSection title="Main Antigravity">
+        <List density="balanced" hasDividers>
+          <ListItem
+            key={HOST_SELECTION_ID}
+            isSelected={selectedName === HOST_SELECTION_ID}
+            onClick={onSelectHost}
+            startContent={
+              <Avatar
+                name={hostAccount?.email ?? "Main Antigravity"}
+                size="sm"
+                shape="rounded"
+                tooltip={false}
+              />
+            }
+            label={hostAccount?.email ?? "Main Antigravity"}
+            description={`Host primary · ${pluralize(
+              hostAccount?.projects_count ?? 0,
+              "project"
+            )}${
+              hostCronCount > 0 ? ` · ${pluralize(hostCronCount, "cron")}` : ""
+            }`}
+            endContent={renderRuntimeEndState(hostCombinedState)}
+          />
+        </List>
+      </SideNavSection>
+
+      <SideNavSection title="Backup Profiles">
         {filteredProfiles.length === 0 ? (
           <VStack padding={3}>
             <Text type="supporting" color="secondary">
               {profiles.length === 0
-                ? "No profiles provisioned yet."
-                : "No profiles match this filter."}
+                ? "No backup profiles provisioned yet."
+                : "No backup profiles match this filter."}
             </Text>
           </VStack>
         ) : (
           <List density="balanced" hasDividers>
             {filteredProfiles.map((profile) => {
               const combined = computeCombinedState(profile.runtime);
+              const backupAutoEnabled =
+                profile.sync_state?.automations_enabled ?? 0;
               return (
                 <ListItem
                   key={profile.manifest.name}
@@ -187,7 +238,16 @@ export function ProfilesSideRail({
                     />
                   }
                   label={profile.manifest.label}
-                  description={`${profile.manifest.name} · ${profile.manifest.default_target.toUpperCase()} · ${formatBytes(profile.disk_bytes)}`}
+                  description={`${
+                    profile.account?.email &&
+                    !profile.manifest.label
+                      .toLowerCase()
+                      .includes(profile.account.email.toLowerCase())
+                      ? profile.account.email
+                      : profile.manifest.name
+                  } · ${
+                    backupAutoEnabled > 0 ? "Active quota" : "Standby"
+                  } · ${formatBytes(profile.disk_bytes)}`}
                   endContent={renderRuntimeEndState(combined)}
                 />
               );
@@ -199,16 +259,364 @@ export function ProfilesSideRail({
   );
 }
 
+interface HostPrimaryDetailViewProps {
+  profiles: ProfileSummary[];
+  hostAccount: HostAccountInfo | null;
+  hostRuntime: HostRuntimeInfo | null;
+  flow: QuotaFlowInfo | null;
+  actionBusy: string | null;
+  syncBusy: string | null;
+  onOpenCreate: () => void;
+  onSync: (
+    name: string,
+    restart: boolean,
+    automationsMode?: AutomationsMode
+  ) => Promise<void>;
+  onSwitch: (name: string) => Promise<void>;
+  onReturnHost: (fromProfile: string) => Promise<void>;
+  onOpenHandoff: () => void;
+}
+
+function HostPrimaryDetailView({
+  profiles,
+  hostAccount,
+  hostRuntime,
+  flow,
+  actionBusy,
+  syncBusy,
+  onOpenCreate,
+  onSync,
+  onSwitch,
+  onReturnHost,
+  onOpenHandoff,
+}: HostPrimaryDetailViewProps) {
+  const fallbackHub: TargetRuntime = {
+    target: "hub",
+    state: "stopped",
+    pids: [],
+    lock_files: [],
+  };
+  const fallbackIde: TargetRuntime = {
+    target: "ide",
+    state: "stopped",
+    pids: [],
+    lock_files: [],
+  };
+  const hubRt = hostRuntime?.hub ?? fallbackHub;
+  const ideRt = hostRuntime?.ide ?? fallbackIde;
+  const hostState = computeCombinedState({ hub: hubRt, ide: ideRt });
+  const hostCronCount =
+    (hubRt.schedule_count ?? 0) + (ideRt.schedule_count ?? 0);
+  const hostAutoTotal = hostAccount?.automations_count ?? 0;
+  const hostAutoEnabled = hostAccount?.automations_enabled ?? 0;
+  const primaryBackup = profiles[0] ?? null;
+  const activeBackupName = flow?.active_profiles[0] ?? null;
+  const hostTitle = hostAccount?.email ?? "Main Antigravity";
+
+  return (
+    <Layout
+      padding={6}
+      height="fill"
+      header={
+        <LayoutHeader hasDivider>
+          <HStack hAlign="between" vAlign="center" gap={4} wrap="wrap">
+            <HStack gap={3} vAlign="center" wrap="wrap">
+              <Avatar
+                name={hostTitle}
+                size="lg"
+                shape="rounded"
+                tooltip={false}
+                status={
+                  <AvatarStatusDot
+                    variant={
+                      hostState === "running"
+                        ? "success"
+                        : hostState === "stale-lock"
+                          ? "error"
+                          : "neutral"
+                    }
+                    label={formatRuntimeState(hostState)}
+                  />
+                }
+              />
+              <VStack gap={1}>
+                <HStack gap={2} vAlign="center" wrap="wrap">
+                  <Heading level={1}>{hostTitle}</Heading>
+                  {hostState === "running" ? (
+                    <Badge variant="success" label="Running" />
+                  ) : hostState === "stale-lock" ? (
+                    <Badge variant="warning" label="Stale lock" />
+                  ) : (
+                    <HStack gap={1} vAlign="center">
+                      <StatusDot variant="neutral" label="Stopped" />
+                      <Text type="supporting" color="secondary">
+                        Stopped
+                      </Text>
+                    </HStack>
+                  )}
+                </HStack>
+                <HStack gap={1.5} vAlign="center" wrap="wrap">
+                  <Code color="secondary">host</Code>
+                  <Token size="sm" color="blue" label="Primary source" />
+                  <Text type="supporting" color="secondary">
+                    · {pluralize(hostAccount?.projects_count ?? 0, "project")} ·{" "}
+                    {pluralize(hostAccount?.sessions_count ?? 0, "session")} ·{" "}
+                    {pluralize(hostAutoTotal, "automation")} ({hostAutoEnabled}{" "}
+                    enabled)
+                  </Text>
+                </HStack>
+              </VStack>
+            </HStack>
+
+            <HStack gap={2} vAlign="center" wrap="wrap">
+              {!primaryBackup ? (
+                <Button
+                  size="sm"
+                  variant="primary"
+                  label="New Profile"
+                  onClick={onOpenCreate}
+                />
+              ) : (
+                <>
+                  {activeBackupName ? (
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      label="Return to Host"
+                      tooltip="Write backup handoff into Host, pause backup Automations, and copy resume prompt"
+                      isDisabled={actionBusy !== null || syncBusy !== null}
+                      isLoading={syncBusy === "return-host"}
+                      onClick={() => void onReturnHost(activeBackupName)}
+                    />
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      label="Take Over Quota"
+                      tooltip={`Sync Host handoff and activate Automations on ${primaryBackup.manifest.name}`}
+                      isDisabled={actionBusy !== null || syncBusy !== null}
+                      isLoading={syncBusy === "switch"}
+                      onClick={() => void onSwitch(primaryBackup.manifest.name)}
+                    />
+                  )}
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    label="Sync Standby"
+                    tooltip={`Copy projects, settings, and paused Automations into ${primaryBackup.manifest.name}`}
+                    isDisabled={actionBusy !== null || syncBusy !== null}
+                    isLoading={syncBusy === "sync"}
+                    onClick={() =>
+                      void onSync(primaryBackup.manifest.name, false, "paused")
+                    }
+                  />
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    label="View Handoff"
+                    onClick={onOpenHandoff}
+                  />
+                </>
+              )}
+            </HStack>
+          </HStack>
+        </LayoutHeader>
+      }
+      content={
+        <LayoutContent>
+          <VStack gap={4}>
+            <Card padding={4}>
+              <Grid columns={{ minWidth: 170, max: 4 }} gap={4}>
+                <VStack gap={1}>
+                  <Text type="label" color="secondary">
+                    Hub Target
+                  </Text>
+                  <HStack gap={1.5} vAlign="center">
+                    <StatusDot
+                      variant={runtimeDotVariant(hubRt.state)}
+                      label={formatRuntimeState(hubRt.state)}
+                    />
+                    <Text weight="semibold">
+                      {formatRuntimeState(hubRt.state)}
+                    </Text>
+                  </HStack>
+                  <Text type="supporting" color="secondary" hasTabularNumbers>
+                    {formatTargetPidSummary(hubRt)}
+                  </Text>
+                </VStack>
+
+                <VStack gap={1}>
+                  <Text type="label" color="secondary">
+                    IDE Target
+                  </Text>
+                  <HStack gap={1.5} vAlign="center">
+                    <StatusDot
+                      variant={runtimeDotVariant(ideRt.state)}
+                      label={formatRuntimeState(ideRt.state)}
+                    />
+                    <Text weight="semibold">
+                      {formatRuntimeState(ideRt.state)}
+                    </Text>
+                  </HStack>
+                  <Text type="supporting" color="secondary" hasTabularNumbers>
+                    {formatTargetPidSummary(ideRt)}
+                  </Text>
+                </VStack>
+
+                <VStack gap={1}>
+                  <Text type="label" color="secondary">
+                    Live Automations
+                  </Text>
+                  <HStack gap={1.5} vAlign="center">
+                    <StatusDot
+                      variant={hostCronCount > 0 ? "success" : "neutral"}
+                      label={
+                        hostCronCount > 0
+                          ? "Active schedulers"
+                          : "No live schedulers"
+                      }
+                    />
+                    <Text weight="semibold" hasTabularNumbers>
+                      {pluralize(hostCronCount, "cron runner")}
+                    </Text>
+                  </HStack>
+                  <Text type="supporting" color="secondary" hasTabularNumbers>
+                    {hostAutoEnabled} of {hostAutoTotal} enabled on disk
+                  </Text>
+                </VStack>
+
+                <VStack gap={1}>
+                  <Text type="label" color="secondary">
+                    Active Quota Flow
+                  </Text>
+                  <HStack gap={1.5} vAlign="center">
+                    <StatusDot
+                      variant={
+                        flow?.dual_automations_warning ? "warning" : "success"
+                      }
+                      label={flow?.mode ?? "host_primary"}
+                    />
+                    <Text weight="semibold">
+                      {flow?.dual_automations_warning
+                        ? "Dual crons"
+                        : activeBackupName
+                          ? `Backup (${activeBackupName})`
+                          : "Host primary"}
+                    </Text>
+                  </HStack>
+                  <Text type="supporting" color="secondary" hasTabularNumbers>
+                    {pluralize(
+                      flow?.standby_profiles.length ?? 0,
+                      "standby profile"
+                    )}
+                  </Text>
+                </VStack>
+              </Grid>
+            </Card>
+
+            <Grid columns={{ minWidth: 340, max: 2 }} gap={4}>
+              <Card padding={5}>
+                <VStack gap={3}>
+                  <Heading level={2}>Quota and Automation Flow</Heading>
+                  <Text type="supporting" color="secondary">
+                    {flow?.summary ??
+                      "Main Antigravity serves as your primary workspace and customization source."}
+                  </Text>
+                  <MetadataList
+                    columns={1}
+                    label={{ position: "start", width: 140 }}
+                  >
+                    <MetadataListItem label="1. Primary Host">
+                      Work in Main Antigravity while Sync Standby copies
+                      projects, clickable sidebar sessions, worktrees, and
+                      paused Automations into your backup profile.
+                    </MetadataListItem>
+                    <MetadataListItem label="2. Quota Takeover">
+                      Click Take Over Quota on a backup profile to sync SQLite
+                      session trajectories, rebuild the Hub sidebar index,
+                      enable Automations, and launch.
+                    </MetadataListItem>
+                    <MetadataListItem label="3. Weekly Return">
+                      Click Return to Host to merge new backup sessions back
+                      into Main Antigravity, update HANDOFF_CONTEXT.md, and
+                      reset backup Automations to paused standby.
+                    </MetadataListItem>
+                  </MetadataList>
+                </VStack>
+              </Card>
+
+              <Card padding={5}>
+                <VStack gap={3}>
+                  <Heading level={2}>Host Source Inventory</Heading>
+                  <MetadataList>
+                    <MetadataListItem label="Account">
+                      {hostAccount?.email ?? "Unsigned"} (
+                      {hostAccount?.source ?? "unsigned"})
+                    </MetadataListItem>
+                    <MetadataListItem label="Projects">
+                      {pluralize(hostAccount?.projects_count ?? 0, "project")}{" "}
+                      configured
+                    </MetadataListItem>
+                    <MetadataListItem label="Sessions">
+                      {pluralize(
+                        hostAccount?.sessions_count ?? 0,
+                        "clickable session"
+                      )}
+                    </MetadataListItem>
+                    <MetadataListItem label="Automations">
+                      {hostAutoTotal > 0
+                        ? `${pluralize(hostAutoTotal, "automation")} (${hostAutoEnabled} enabled, ${pluralize(hostCronCount, "live runner")})`
+                        : "0 configured"}
+                    </MetadataListItem>
+                    <MetadataListItem label="Agents and Plugins">
+                      {pluralize(hostAccount?.plugins_count ?? 0, "plugin")} ·{" "}
+                      {pluralize(hostAccount?.agents_count ?? 0, "agent")} ·{" "}
+                      {pluralize(hostAccount?.skills_count ?? 0, "skill")}
+                    </MetadataListItem>
+                    <MetadataListItem label="MCP and Handoff">
+                      {hostAccount?.mcp_present ? "MCP ready" : "No MCP"} ·{" "}
+                      {hostAccount?.hooks_present ? "Hooks active" : "No hooks"}{" "}
+                      ·{" "}
+                      {hostAccount?.handoff_present
+                        ? "Return handoff ready"
+                        : "No return handoff"}
+                    </MetadataListItem>
+                    <MetadataListItem label="Source Safety">
+                      Host ~/.gemini stays unlocked during sync; Return to Host
+                      merges new backup sessions and skips open locked threads.
+                    </MetadataListItem>
+                  </MetadataList>
+                </VStack>
+              </Card>
+            </Grid>
+          </VStack>
+        </LayoutContent>
+      }
+    />
+  );
+}
+
 export interface ProfilesDetailPaneProps {
   profiles: ProfileSummary[];
+  selectedName: string | null;
   detail: ProfileDetail | null;
   targets: { hub: TargetInfo; ide: TargetInfo } | null;
+  hostAccount?: HostAccountInfo | null;
+  hostRuntime?: HostRuntimeInfo | null;
+  flow?: QuotaFlowInfo | null;
   detailLoading: boolean;
   actionBusy: string | null;
+  syncBusy?: string | null;
   confirmDeleteOpen: boolean;
   onConfirmDeleteOpenChange: (open: boolean) => void;
+  onSelectHost: () => void;
   onOpenCreate: () => void;
   onOpenClone: () => void;
+  onOpenRename: () => void;
+  onSync: (name: string, restart: boolean, automationsMode?: AutomationsMode) => Promise<void>;
+  onSwitch: (name: string) => Promise<void>;
+  onReturnHost: (fromProfile: string) => Promise<void>;
+  onOpenHandoff: () => void;
   onLaunch: (name: string, target: TargetKind) => Promise<void>;
   onStop: (name: string) => Promise<void>;
   onRepair: (name: string) => Promise<void>;
@@ -223,14 +631,25 @@ export interface ProfilesDetailPaneProps {
 
 export function ProfilesDetailPane({
   profiles,
+  selectedName,
   detail,
   targets,
+  hostAccount = null,
+  hostRuntime = null,
+  flow = null,
   detailLoading,
   actionBusy,
+  syncBusy = null,
   confirmDeleteOpen,
   onConfirmDeleteOpenChange,
+  onSelectHost,
   onOpenCreate,
   onOpenClone,
+  onOpenRename,
+  onSync,
+  onSwitch,
+  onReturnHost,
+  onOpenHandoff,
   onLaunch,
   onStop,
   onRepair,
@@ -281,27 +700,20 @@ export function ProfilesDetailPane({
     setForceStopDelete(false);
   }, [detail]);
 
-  if (profiles.length === 0) {
+  if (selectedName === HOST_SELECTION_ID || profiles.length === 0) {
     return (
-      <Layout
-        padding={6}
-        height="fill"
-        content={
-          <LayoutContent>
-            <EmptyState
-              headingLevel={1}
-              title="No profiles provisioned"
-              description="Create a sandbox profile with separate OAuth tokens and locked HOME paths."
-              actions={
-                <Button
-                  variant="primary"
-                  label="New Profile"
-                  onClick={onOpenCreate}
-                />
-              }
-            />
-          </LayoutContent>
-        }
+      <HostPrimaryDetailView
+        profiles={profiles}
+        hostAccount={hostAccount}
+        hostRuntime={hostRuntime}
+        flow={flow}
+        actionBusy={actionBusy}
+        syncBusy={syncBusy}
+        onOpenCreate={onOpenCreate}
+        onSync={onSync}
+        onSwitch={onSwitch}
+        onReturnHost={onReturnHost}
+        onOpenHandoff={onOpenHandoff}
       />
     );
   }
@@ -336,6 +748,20 @@ export function ProfilesDetailPane({
   const altInstalled = altTarget === "hub" ? hubInstalled : ideInstalled;
   const primaryLaunchLabel = defaultTarget === "hub" ? "Launch Hub" : "Launch IDE";
   const altLaunchLabel = altTarget === "hub" ? "Launch Hub" : "Launch IDE";
+  const autoCount = detail.sync_state?.automations_count ?? 0;
+  const autoEnabled = detail.sync_state?.automations_enabled ?? 0;
+  const hostCombinedState: RuntimeStateType = hostRuntime
+    ? computeCombinedState(hostRuntime)
+    : "stopped";
+  const hostCronCount =
+    (hostRuntime?.hub.schedule_count ?? 0) +
+    (hostRuntime?.ide.schedule_count ?? 0);
+  const hostRootPid =
+    hostRuntime?.hub.root_pids?.[0] ??
+    hostRuntime?.ide.root_pids?.[0] ??
+    hostRuntime?.hub.pids[0] ??
+    hostRuntime?.ide.pids[0] ??
+    null;
 
   const overflowItems: DropdownMenuOption[] = [
     ...(anyRunning
@@ -348,12 +774,67 @@ export function ProfilesDetailPane({
           },
         ]
       : []),
+    ...(autoEnabled > 0
+      ? [
+          {
+            id: "return-host",
+            label: "Return to Host",
+            description:
+              "Write backup handoff into Main Antigravity and pause backup Automations",
+            isDisabled: actionBusy !== null || syncBusy !== null,
+            onClick: () => void onReturnHost(detail.manifest.name),
+          },
+        ]
+      : []),
+    {
+      id: "switch",
+      label: "Take Over Quota",
+      description: "Sync setup and handoff, enable Automations, and relaunch",
+      isDisabled: actionBusy !== null || syncBusy !== null,
+      onClick: () => void onSwitch(detail.manifest.name),
+    },
+    {
+      id: "sync",
+      label: "Sync Host Setup",
+      description: hostAccount?.email
+        ? `Copy setup and paused Automations from ${hostAccount.email}`
+        : "Copy sanitized setup and Automations in paused standby",
+      isDisabled: actionBusy !== null || syncBusy !== null,
+      onClick: () => void onSync(detail.manifest.name, false, "paused"),
+    },
+    {
+      id: "sync_restart",
+      label: "Sync and Restart",
+      description: "Re-sync setup and paused Automations, then relaunch target",
+      isDisabled: actionBusy !== null || syncBusy !== null,
+      onClick: () => void onSync(detail.manifest.name, true, "paused"),
+    },
+    {
+      id: "sync_active",
+      label: "Sync and Enable Automations",
+      description: "Copy Host Automations enabled for active scheduled runs",
+      isDisabled: actionBusy !== null || syncBusy !== null,
+      onClick: () => void onSync(detail.manifest.name, true, "active"),
+    },
+    {
+      id: "handoff",
+      label: "View Host Handoff",
+      description: "Inspect recent Host conversations and resume prompt",
+      onClick: onOpenHandoff,
+    },
     {
       id: "repair",
       label: "Repair Locks",
       icon: <Icon icon="wrench" size="sm" />,
       isDisabled: actionBusy !== null,
       onClick: () => void onRepair(detail.manifest.name),
+    },
+    {
+      id: "rename",
+      label: "Rename Profile",
+      description: "Update slug or label while keeping OAuth login intact",
+      isDisabled: actionBusy !== null || syncBusy !== null,
+      onClick: onOpenRename,
     },
     {
       id: "clone",
@@ -442,6 +923,19 @@ export function ProfilesDetailPane({
                   </HStack>
                   <HStack gap={1.5} vAlign="center" wrap="wrap">
                     <Code color="secondary">{detail.manifest.name}</Code>
+                    <Token
+                      size="sm"
+                      color={detail.account?.email ? "blue" : "gray"}
+                      label={
+                        detail.account?.email
+                          ? detail.manifest.label
+                              .toLowerCase()
+                              .includes(detail.account.email.toLowerCase())
+                            ? "OAuth verified"
+                            : detail.account.email
+                          : "Unsigned"
+                      }
+                    />
                     <Text type="supporting" color="secondary">
                       · {formatAuthMode(detail.manifest.auth_mode)} ·{" "}
                       {formatLinkPolicy(detail.manifest.link_policy)} · Created{" "}
@@ -500,6 +994,19 @@ export function ProfilesDetailPane({
                     }
                   />
                 )}
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  label="Sync Setup"
+                  tooltip={
+                    hostAccount?.email
+                      ? `Sync sanitized setup and paused Automations from ${hostAccount.email}`
+                      : "Sync sanitized host setup, Automations, and handoff"
+                  }
+                  isDisabled={actionBusy !== null || syncBusy !== null}
+                  isLoading={syncBusy === "sync"}
+                  onClick={() => void onSync(detail.manifest.name, false, "paused")}
+                />
                 <MoreMenu
                   label="More profile actions"
                   size="sm"
@@ -515,6 +1022,81 @@ export function ProfilesDetailPane({
         content={
           <LayoutContent>
             <VStack gap={4}>
+              <Card padding={4}>
+                <HStack hAlign="between" vAlign="center" gap={3} wrap="wrap">
+                  <VStack gap={1}>
+                    <HStack gap={2} vAlign="center" wrap="wrap">
+                      <Text type="label" color="secondary">
+                        Quota and Automation Flow
+                      </Text>
+                      {flow?.dual_automations_warning ? (
+                        <Badge variant="warning" label="Dual crons" />
+                      ) : autoEnabled > 0 ? (
+                        <Token size="sm" color="blue" label="Backup active" />
+                      ) : (
+                        <Token size="sm" color="gray" label="Standby paused" />
+                      )}
+                    </HStack>
+                    <HStack gap={1.5} vAlign="center" wrap="wrap">
+                      <StatusDot
+                        variant={runtimeDotVariant(hostCombinedState)}
+                        label={`Main Antigravity ${formatRuntimeState(hostCombinedState)}`}
+                      />
+                      <Text weight="medium">
+                        Main: {hostAccount?.email ?? "Unsigned"} (
+                        {formatRuntimeState(hostCombinedState)}
+                        {hostRootPid ? `, PID ${hostRootPid}` : ""}
+                        {hostCronCount > 0
+                          ? `, ${pluralize(hostCronCount, "cron")}`
+                          : ""}
+                        )
+                      </Text>
+                      <Text type="supporting" color="secondary">
+                        · Backup:{" "}
+                        {detail.account?.email ?? detail.manifest.label} (
+                        {autoEnabled > 0
+                          ? `${pluralize(autoEnabled, "automation")} active`
+                          : `${pluralize(autoCount, "automation")} paused`}
+                        )
+                      </Text>
+                    </HStack>
+                    {flow?.dual_automations_warning ? (
+                      <Text type="supporting" color="secondary">
+                        Both Main Antigravity and {detail.manifest.name} have
+                        active automations. Click Return to Host to pause backup
+                        crons, or quit Main Antigravity while using backup quota.
+                      </Text>
+                    ) : null}
+                  </VStack>
+                  <HStack gap={2} vAlign="center" wrap="wrap">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      label="Inspect Host"
+                      onClick={onSelectHost}
+                    />
+                    {autoEnabled > 0 ? (
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        label="Return to Host"
+                        isDisabled={actionBusy !== null || syncBusy !== null}
+                        isLoading={syncBusy === "return-host"}
+                        onClick={() => void onReturnHost(detail.manifest.name)}
+                      />
+                    ) : (
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        label="Take Over Quota"
+                        isDisabled={actionBusy !== null || syncBusy !== null}
+                        isLoading={syncBusy === "switch"}
+                        onClick={() => void onSwitch(detail.manifest.name)}
+                      />
+                    )}
+                  </HStack>
+                </HStack>
+              </Card>
 
               <Card padding={4}>
                 <Grid columns={{ minWidth: 170, max: 4 }} gap={4}>
@@ -532,9 +1114,7 @@ export function ProfilesDetailPane({
                       </Text>
                     </HStack>
                     <Text type="supporting" color="secondary" hasTabularNumbers>
-                      {detail.runtime.hub.pids.length > 0
-                        ? `PID ${detail.runtime.hub.pids.join(", ")}`
-                        : pluralize(detail.runtime.hub.lock_files.length, "lock")}
+                      {formatTargetPidSummary(detail.runtime.hub)}
                     </Text>
                   </VStack>
 
@@ -552,9 +1132,7 @@ export function ProfilesDetailPane({
                       </Text>
                     </HStack>
                     <Text type="supporting" color="secondary" hasTabularNumbers>
-                      {detail.runtime.ide.pids.length > 0
-                        ? `PID ${detail.runtime.ide.pids.join(", ")}`
-                        : pluralize(detail.runtime.ide.lock_files.length, "lock")}
+                      {formatTargetPidSummary(detail.runtime.ide)}
                     </Text>
                   </VStack>
 
@@ -652,7 +1230,7 @@ export function ProfilesDetailPane({
                             },
                             {
                               value: "dev",
-                              label: "Dev (toolchain caches)",
+                              label: "Dev (toolchains and .agents)",
                             },
                           ]}
                         />
@@ -731,6 +1309,55 @@ export function ProfilesDetailPane({
                             {detail.isolation.permissions.mcp_config_file ??
                               "--"}
                           </Code>
+                        </MetadataListItem>
+                        <MetadataListItem label="Handoff digest">
+                          <Code>
+                            {detail.isolation.permissions.handoff_file ?? "--"}
+                          </Code>
+                        </MetadataListItem>
+                      </MetadataList>
+                    </VStack>
+
+                    <Divider />
+
+                    <VStack gap={2}>
+                      <Heading level={3}>Synced Setup</Heading>
+                      <MetadataList>
+                        <MetadataListItem label="Account">
+                          {detail.account?.email ?? "Unsigned"} (
+                          {detail.account?.source ?? "unsigned"})
+                        </MetadataListItem>
+                        <MetadataListItem label="Projects">
+                          {detail.sync_state?.projects_count ?? 0} synced
+                        </MetadataListItem>
+                        <MetadataListItem label="Sessions">
+                          {pluralize(
+                            detail.sync_state?.sessions_count ?? 0,
+                            "clickable session"
+                          )}
+                        </MetadataListItem>
+                        <MetadataListItem label="Automations">
+                          {autoCount > 0
+                            ? `${pluralize(autoCount, "automation")} (${
+                                autoEnabled > 0
+                                  ? `${autoEnabled} active`
+                                  : "paused standby"
+                              })`
+                            : "0 synced"}
+                        </MetadataListItem>
+                        <MetadataListItem label="Agents and Plugins">
+                          {pluralize(detail.sync_state?.plugins_count ?? 0, "plugin")}{" "}
+                          ·{" "}
+                          {pluralize(detail.sync_state?.agents_count ?? 0, "agent")}{" "}
+                          ·{" "}
+                          {pluralize(detail.sync_state?.skills_count ?? 0, "skill")}
+                        </MetadataListItem>
+                        <MetadataListItem label="MCP and Handoff">
+                          {detail.sync_state?.mcp_present ? "MCP ready" : "No MCP"}{" "}
+                          ·{" "}
+                          {detail.sync_state?.handoff_present
+                            ? "Handoff ready"
+                            : "No handoff"}
                         </MetadataListItem>
                       </MetadataList>
                     </VStack>

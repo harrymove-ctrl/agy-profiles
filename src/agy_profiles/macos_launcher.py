@@ -35,6 +35,24 @@ def _escape_applescript_string(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def verify_launcher_signature(bundle_path: Path) -> bool:
+    """Verify macOS code signature integrity for a compiled .app launcher bundle."""
+    if sys.platform != "darwin" or not bundle_path.is_dir():
+        return True
+    codesign_bin = shutil.which("codesign") or "/usr/bin/codesign"
+    if not Path(codesign_bin).exists():
+        return True
+    proc = subprocess.run(
+        [codesign_bin, "--verify", "--deep", "--strict", str(bundle_path)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
 def build_launcher(
     profile_name: str,
     label: str,
@@ -68,8 +86,13 @@ def build_launcher(
     if root is not None:
         cmd_parts.extend(["--root", str(root)])
     cmd_parts.extend(["launch", clean_name, "--target", valid_target])
-    quoted_shell_cmd = " ".join(shlex.quote(part) for part in cmd_parts) + " >/dev/null 2>&1 &"
-    applescript = 'do shell script "{}"\n'.format(_escape_applescript_string(quoted_shell_cmd))
+    quoted_launch = " ".join(shlex.quote(part) for part in cmd_parts)
+    shell_cmd = (
+        'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin:$PATH"; '
+        'mkdir -p "$HOME/Library/Logs" >/dev/null 2>&1 || true; '
+        '{} >> "$HOME/Library/Logs/agy-profiles-launcher.log" 2>&1 &'
+    ).format(quoted_launch)
+    applescript = 'do shell script "{}"\n'.format(_escape_applescript_string(shell_cmd))
 
     if bundle_path.exists():
         shutil.rmtree(str(bundle_path))
@@ -106,6 +129,9 @@ def build_launcher(
         pl["CFBundleIdentifier"] = "io.github.harrymove-ctrl.agy-profiles.{}.{}".format(clean_name, valid_target)
         pl["CFBundleName"] = bundle_path.stem
         pl["LSUIElement"] = True
+        pl["NSRemovableVolumesUsageDescription"] = (
+            "Allows launching isolated Antigravity profiles stored on external volumes."
+        )
         with open(str(plist_path), "wb") as fh:
             plistlib.dump(pl, fh)
 
@@ -120,11 +146,32 @@ def build_launcher(
                 shutil.copy2(str(src_icon), str(dst_icon))
                 break
 
+    # Ad-hoc re-sign after Info.plist and icon mutations so arm64 AMFI accepts the bundle.
+    codesign_bin = shutil.which("codesign") or "/usr/bin/codesign"
+    signed = False
+    if Path(codesign_bin).exists():
+        sign_proc = subprocess.run(
+            [codesign_bin, "--force", "--deep", "--sign", "-", str(bundle_path)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if sign_proc.returncode != 0:
+            raise ToolError(
+                "launcher_error",
+                "codesign failed: {}.".format(sign_proc.stderr.strip() or sign_proc.stdout.strip()),
+                "Verify Apple developer command-line tools are available and retry.",
+            )
+        signed = True
+
     return {
         "profile": clean_name,
         "target": valid_target,
         "bundle_path": str(bundle_path),
         "bundle_id": "io.github.harrymove-ctrl.agy-profiles.{}.{}".format(clean_name, valid_target),
+        "signed": signed,
     }
 
 

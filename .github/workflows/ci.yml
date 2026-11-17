@@ -21,11 +21,28 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Set up Node 22 for web-ui check
+        if: matrix.python-version == '3.13'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web-ui/package-lock.json
+
       - name: Verify executable wrappers and installer dry-run
         run: |
           test -x bin/agy-profiles
           test -x bin/agyp
           bash install.sh --dry-run
+
+      - name: Build web-ui, audit Astryx purity, and verify zero web_static drift
+        if: matrix.python-version == '3.13'
+        run: |
+          cd web-ui
+          npm ci
+          npm run build
+          npx astryx doctor
+          git diff --exit-code ../src/agy_profiles/web_static
 
       - name: Run unit and integration tests
         run: python3 -m unittest discover -s tests -v

@@ -17,11 +17,12 @@ from agy_profiles.evidence import utc_now_iso
 
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$")
 HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
-RESERVED_NAMES = {"default", "all", "system", "con", "prn", "aux", "nul"}
+RESERVED_NAMES = {"default", "all", "system", "host", "con", "prn", "aux", "nul"}
 
 VALID_TARGETS: Tuple[str, ...] = ("hub", "ide")
 VALID_LINK_POLICIES: Tuple[str, ...] = ("none", "minimal", "dev")
 VALID_AUTH_MODES: Tuple[str, ...] = ("isolated-file", "system-keychain")
+VALID_AUTOMATIONS_MODES: Tuple[str, ...] = ("paused", "active", "strip")
 
 DEFAULT_ACCENTS: List[str] = [
     "#3B82F6",
@@ -101,6 +102,19 @@ def validate_auth_mode(auth_mode: str) -> str:
             {"auth_mode": auth_mode},
         )
     return auth_mode
+
+
+def validate_automations_mode(mode: str) -> str:
+    """Validate sidecar/automation migration mode during host customization sync."""
+    clean = str(mode or "").strip().lower()
+    if clean not in VALID_AUTOMATIONS_MODES:
+        raise ToolError(
+            "invalid_argument",
+            "Unsupported automations mode {!r}.".format(mode),
+            "Use 'paused', 'active', or 'strip'.",
+            {"automations_mode": mode},
+        )
+    return clean
 
 
 def validate_accent(accent: Optional[str]) -> str:

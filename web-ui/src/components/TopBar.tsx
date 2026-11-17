@@ -12,7 +12,12 @@ import { Token } from "@astryxdesign/core/Token";
 import { TopNav, TopNavHeading } from "@astryxdesign/core/TopNav";
 import type { ThemeSlug } from "../astryx-themes";
 import { THEME_OPTIONS } from "../api";
-import type { AppView, TargetInfo } from "../types";
+import type {
+  AppView,
+  HostAccountInfo,
+  HostRuntimeInfo,
+  TargetInfo,
+} from "../types";
 
 export interface TopBarProps {
   version: string;
@@ -20,6 +25,8 @@ export interface TopBarProps {
   view: AppView;
   profileCount: number;
   targets: { hub: TargetInfo; ide: TargetInfo } | null;
+  hostAccount?: HostAccountInfo | null;
+  hostRuntime?: HostRuntimeInfo | null;
   themeSlug: ThemeSlug;
   isDarkOnlyTheme: boolean;
   resolvedMode: "light" | "dark";
@@ -35,6 +42,8 @@ export function TopBar({
   view,
   profileCount,
   targets,
+  hostAccount,
+  hostRuntime,
   themeSlug,
   isDarkOnlyTheme,
   resolvedMode,
@@ -44,8 +53,11 @@ export function TopBar({
   onOpenCreate,
 }: TopBarProps) {
   const isWide = useMediaQuery("(min-width: 1180px)");
+  const isMedium = useMediaQuery("(min-width: 920px)");
   const hubInstalled = targets?.hub.installed ?? false;
   const ideInstalled = targets?.ide.installed ?? false;
+  const hostRunning =
+    hostRuntime?.hub.state === "running" || hostRuntime?.ide.state === "running";
 
   return (
     <TopNav
@@ -71,12 +83,20 @@ export function TopBar({
           size="md"
         >
           <Tab value="profiles" label={`Profiles (${profileCount})`} />
+          <Tab value="handoff" label="Handoff" />
           <Tab value="obligations" label="Obligations" />
           <Tab value="doctor" label="Doctor" />
         </TabList>
       }
       endContent={
         <HStack gap={2} vAlign="center" wrap="wrap">
+          {isMedium && hostAccount?.email ? (
+            <Token
+              size="sm"
+              color={hostRunning ? "blue" : "gray"}
+              label={`Host: ${hostAccount.email} (${hostRunning ? "Running" : "Stopped"})`}
+            />
+          ) : null}
           {isWide && targets ? (
             !hubInstalled && !ideInstalled ? (
               <Badge variant="warning" label="No Targets" />

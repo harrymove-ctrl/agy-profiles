@@ -461,6 +461,175 @@ class ConfigAndIsolationTests(unittest.TestCase):
         self.assertEqual(gemini_text.count(HANDOFF_START_MARKER), 1)
         _ = write_handoff_context
 
+    def test_automations_migration_paused_active_strip_and_prune(self) -> None:
+        host_gemini = self.fake_home / ".gemini"
+        (host_gemini / "config" / "sidecars" / "auto-one").mkdir(parents=True)
+        (host_gemini / "config" / "projects").mkdir(parents=True)
+        (host_gemini / "config" / "skills" / "skill-live").mkdir(parents=True)
+        (host_gemini / "config" / "skills" / "skill-live" / "SKILL.md").write_text("# Live\n", encoding="utf-8")
+        (host_gemini / "config" / "hooks.json").write_text('{"PreInvocation": []}\n', encoding="utf-8")
+
+        fake_tok = "sk-proj-" + "secret1234567890"
+        host_sidecar_payload = {
+            "builtin": "schedule",
+            "display_name": "Auto One",
+            "args": [
+                "CRON_TZ=UTC 0 9 * * *",
+                "agentapi",
+                "new-conversation",
+                "--",
+                "Write report to {}/antigravity/sidecar_data/auto-one/out.json using {}".format(
+                    host_gemini, fake_tok
+                ),
+            ],
+            "agent_permissions": {
+                "access_grants": [
+                    "write_file({}/antigravity/sidecar_data/auto-one/out.json)".format(host_gemini),
+                ],
+                "workspace_uris": ["file:///Volumes/Dev/sample-repo"],
+            },
+        }
+        (host_gemini / "config" / "sidecars" / "auto-one" / "sidecar.json").write_text(
+            json.dumps(host_sidecar_payload),
+            encoding="utf-8",
+        )
+        (host_gemini / "config" / "config.json").write_text(
+            json.dumps(
+                {
+                    "sidecars": {
+                        "auto-one": {
+                            "enabled": True,
+                            "projectId": "p1",
+                            "resolvedPermissions": {
+                                "accessGrants": [
+                                    "read_file({}/config/skills/skill-live/SKILL.md)".format(host_gemini)
+                                ],
+                                "workspaceUris": ["file:///Volumes/Dev/sample-repo"],
+                            },
+                            "schemaVersion": 1,
+                        },
+                        "stale-deleted-cron": {"enabled": True, "schemaVersion": 1},
+                        "swarm/swarm_board": None,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (host_gemini / "config" / "projects" / "p1.json").write_text(
+            json.dumps({"id": "p1", "name": "LiveProj", "sidecar": {"sidecarId": "auto-one"}}),
+            encoding="utf-8",
+        )
+        deleted_proj = host_gemini / "config" / "projects" / "p_stale.json"
+        deleted_proj.write_text(json.dumps({"id": "p_stale", "name": "StaleProj"}), encoding="utf-8")
+        stale_skill = host_gemini / "config" / "skills" / "skill-stale"
+        stale_skill.mkdir(parents=True)
+        (stale_skill / "SKILL.md").write_text("# Stale\n", encoding="utf-8")
+
+        ctx = RuntimeContext(root=self.root, real_home=self.fake_home)
+        created = call_tool("profile_create", {"name": "auto-box", "label": "Auto Box"}, ctx)
+        profile_dir = Path(created["paths"]["profile_dir"])
+        sandbox_gemini = profile_dir / "home" / ".gemini"
+
+        # 1. Default paused standby: migrates sidecars, rewrites .gemini paths, disables enabled, strips orphans.
+        res_paused = sync_host_customizations(profile_dir, real_home=self.fake_home, automations_mode="paused")
+        self.assertEqual(res_paused["automations_mode"], "paused")
+        self.assertEqual(res_paused["automations_synced"], 1)
+        self.assertEqual(res_paused["automations_enabled"], 0)
+        self.assertEqual(res_paused["projects_synced"], 2)
+        self.assertEqual(res_paused["stripped_sidecars"], 1)
+        self.assertGreaterEqual(res_paused["redacted_secrets"], 1)
+
+        sandbox_sc_file = sandbox_gemini / "config" / "sidecars" / "auto-one" / "sidecar.json"
+        self.assertTrue(sandbox_sc_file.is_file())
+        sc_text = sandbox_sc_file.read_text(encoding="utf-8")
+        self.assertIn(str(sandbox_gemini), sc_text)
+        self.assertNotIn(str(host_gemini), sc_text)
+        self.assertNotIn(fake_tok, sc_text)
+        self.assertTrue((sandbox_gemini / "antigravity" / "sidecar_data" / "auto-one").is_dir())
+        self.assertTrue((sandbox_gemini / "config" / "hooks.json").is_file())
+
+        sandbox_cfg = json.loads((sandbox_gemini / "config" / "config.json").read_text(encoding="utf-8"))
+        self.assertFalse(sandbox_cfg["sidecars"]["auto-one"]["enabled"])
+        self.assertNotIn("stale-deleted-cron", sandbox_cfg["sidecars"])
+        self.assertIn("swarm/swarm_board", sandbox_cfg["sidecars"])
+
+        # 2. Delete a Host project and skill, then sync in active mode -> stale entries pruned, automation enabled.
+        deleted_proj.unlink()
+        (stale_skill / "SKILL.md").unlink()
+        stale_skill.rmdir()
+        res_active = sync_host_customizations(profile_dir, real_home=self.fake_home, automations_mode="active")
+        self.assertEqual(res_active["automations_enabled"], 1)
+        self.assertEqual(res_active["projects_synced"], 1)
+        self.assertGreaterEqual(res_active["pruned_entries"], 2)
+        self.assertFalse((sandbox_gemini / "config" / "projects" / "p_stale.json").exists())
+        self.assertFalse((sandbox_gemini / "config" / "skills" / "skill-stale").exists())
+        sandbox_cfg_active = json.loads((sandbox_gemini / "config" / "config.json").read_text(encoding="utf-8"))
+        self.assertTrue(sandbox_cfg_active["sidecars"]["auto-one"]["enabled"])
+        sandbox_p1 = json.loads((sandbox_gemini / "config" / "projects" / "p1.json").read_text(encoding="utf-8"))
+        self.assertEqual(sandbox_p1["sidecar"]["sidecarId"], "auto-one")
+
+        # 3. Strip mode removes scheduled sidecar definitions and project sidecar links.
+        res_strip = sync_host_customizations(profile_dir, real_home=self.fake_home, automations_mode="strip")
+        self.assertEqual(res_strip["automations_synced"], 0)
+        self.assertEqual(res_strip["automations_enabled"], 0)
+        self.assertFalse((sandbox_gemini / "config" / "sidecars" / "auto-one").exists())
+        sandbox_p1_stripped = json.loads((sandbox_gemini / "config" / "projects" / "p1.json").read_text(encoding="utf-8"))
+        self.assertNotIn("sidecar", sandbox_p1_stripped)
+
+    def test_bidirectional_handoff_from_profile(self) -> None:
+        ctx = RuntimeContext(root=self.root, real_home=self.fake_home)
+        call_tool("profile_create", {"name": "backup-box", "label": "backup@example.com"}, ctx)
+        profile_dir, _ = load_manifest(self.root, "backup-box")
+        sandbox_gemini = profile_dir / "home" / ".gemini"
+        (sandbox_gemini / "antigravity").mkdir(parents=True, exist_ok=True)
+        (sandbox_gemini / "jetski-standalone-oauth-token").write_text(
+            json.dumps({"id_token_email": "backup@example.com"}),
+            encoding="utf-8",
+        )
+        db_path = sandbox_gemini / "antigravity" / "conversation_summaries.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """
+            CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT,
+                preview TEXT,
+                last_modified_time TEXT,
+                workspace_uris TEXT,
+                status TEXT,
+                project_id TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("conv-b1", "Fix backup sync", "Verified backup PR", "2026-11-16 09:00:00+00:00", '["file:///tmp/DemoRepo"]', "CASCADE_RUN_STATUS_IDLE", "p1"),
+        )
+        conn.commit()
+        conn.close()
+
+        digest = call_tool("host_handoff", {"source": "backup-box", "limit": 5}, ctx)
+        self.assertTrue(digest["available"])
+        self.assertEqual(digest["source"], "backup-box")
+        self.assertEqual(digest["source_account"], "backup@example.com")
+        self.assertEqual(digest["count"], 1)
+        self.assertIn("backup-box (backup@example.com)", digest["resume_prompt"])
+
+    def test_obligations_doc_matches_live_obligation_ids(self) -> None:
+        ctx = RuntimeContext(root=self.root, real_home=self.fake_home)
+        report = call_tool("obligations_verify", {}, ctx)
+        obl_doc = (Path(__file__).resolve().parents[1] / "docs" / "OBLIGATIONS.md").read_text(encoding="utf-8")
+        for item in report["items"]:
+            self.assertIn(item["obligation_id"], obl_doc)
+
+    def test_token_prefix_scrubber_preserves_desk_production_hostname_while_redacting_real_sk_tokens(self) -> None:
+        from agy_profiles.isolation import TOKEN_PREFIX_RE
+
+        url_grant = "read_url(gambler-day-desk-production.up.railway.app)"
+        self.assertIsNone(TOKEN_PREFIX_RE.search(url_grant))
+        fake_key = "Bearer " + "sk-" + "live1234567890abcdef"
+        self.assertIsNotNone(TOKEN_PREFIX_RE.search(fake_key))
+
 
 if __name__ == "__main__":
     unittest.main()

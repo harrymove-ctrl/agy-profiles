@@ -4,7 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${HOME}/.local/bin"
 SKILL_DIR="${HOME}/.agents/skills"
+PLUGIN_DIR="${HOME}/.gemini/config/plugins"
 WITH_SKILL=0
+WITH_PLUGIN=0
 DRY_RUN=0
 UNINSTALL=0
 ASSUME_YES=0
@@ -19,6 +21,8 @@ Options:
   --prefix DIR       Target bin directory (default: ~/.local/bin)
   --with-skill       Also link the agy-profiles skill directory
   --skill-dir DIR    Target skills directory for --with-skill (default: ~/.agents/skills)
+  --with-plugin      Also link the native Antigravity plugin bundle (sidecar UI, MCP, skill)
+  --plugin-dir DIR   Target plugins directory for --with-plugin (default: ~/.gemini/config/plugins)
   --dry-run          Print planned operations without modifying the filesystem
   --uninstall        Remove installed symlinks pointing to this repository
   --yes              Overwrite conflicting non-repo symlinks without prompting
@@ -40,6 +44,15 @@ while [[ $# -gt 0 ]]; do
             ;;
         --with-skill)
             WITH_SKILL=1
+            shift
+            ;;
+        --plugin-dir)
+            [[ $# -ge 2 ]] || { echo "Error: --plugin-dir requires a directory argument" >&2; exit 2; }
+            PLUGIN_DIR="$2"
+            shift 2
+            ;;
+        --with-plugin)
+            WITH_PLUGIN=1
             shift
             ;;
         --dry-run)
@@ -131,12 +144,16 @@ install_repo_link() {
 BIN_PRIMARY="${SCRIPT_DIR}/bin/agy-profiles"
 BIN_ALIAS="${SCRIPT_DIR}/bin/agyp"
 SKILL_SRC="${SCRIPT_DIR}/.agents/skills/agy-profiles"
+PLUGIN_SRC="${SCRIPT_DIR}/antigravity-plugin"
 
 if [[ "${UNINSTALL}" -eq 1 ]]; then
     remove_repo_link "${PREFIX}/agy-profiles" "${BIN_PRIMARY}"
     remove_repo_link "${PREFIX}/agyp" "${BIN_ALIAS}"
     if [[ "${WITH_SKILL}" -eq 1 ]]; then
         remove_repo_link "${SKILL_DIR}/agy-profiles" "${SKILL_SRC}"
+    fi
+    if [[ "${WITH_PLUGIN}" -eq 1 ]]; then
+        remove_repo_link "${PLUGIN_DIR}/agy-profiles" "${PLUGIN_SRC}"
     fi
     exit 0
 fi
@@ -160,6 +177,15 @@ if [[ "${WITH_SKILL}" -eq 1 ]]; then
         install_repo_link "${SKILL_SRC}" "${SKILL_DIR}/agy-profiles"
     else
         echo "Notice: skill directory ${SKILL_SRC} not present; skipping --with-skill" >&2
+    fi
+fi
+
+if [[ "${WITH_PLUGIN}" -eq 1 ]]; then
+    if [[ -d "${PLUGIN_SRC}" ]]; then
+        run_cmd mkdir -p "${PLUGIN_DIR}"
+        install_repo_link "${PLUGIN_SRC}" "${PLUGIN_DIR}/agy-profiles"
+    else
+        echo "Notice: plugin directory ${PLUGIN_SRC} not present; skipping --with-plugin" >&2
     fi
 fi
 

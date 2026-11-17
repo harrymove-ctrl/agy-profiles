@@ -15,7 +15,9 @@ from agy_profiles.config import ProfileManifest, TargetInfo, save_manifest
 from agy_profiles.errors import ToolError
 from agy_profiles.isolation import provision_profile_dirs
 from agy_profiles.process_guard import (
+    command_matches_host_target,
     command_matches_user_data_dir,
+    inspect_host_runtime,
     inspect_locks,
     launch_profile,
     list_profile_processes,
@@ -83,6 +85,75 @@ class ProcessGuardTests(unittest.TestCase):
         ]
         matched = list_profile_processes(self.profile_dir, ps_rows=rows)
         self.assertEqual([r["pid"] for r in matched["hub"]], [100, 101, 102])
+
+    def test_inspect_host_runtime_isolates_host_from_sandboxes_and_counts_crons(self) -> None:
+        fake_home = self.base / "host-home"
+        fake_home.mkdir(mode=0o700)
+        default_hub_dir = fake_home / "Library" / "Application Support" / "Antigravity"
+        hub_bin = "/Applications/Antigravity.app/Contents/MacOS/Antigravity"
+        ide_bin = "/Applications/Antigravity IDE.app/Contents/MacOS/Electron"
+
+        self.assertTrue(command_matches_host_target(hub_bin, hub_bin, default_hub_dir))
+        self.assertFalse(
+            command_matches_host_target(
+                "{} --type=renderer".format(hub_bin),
+                hub_bin,
+                default_hub_dir,
+            )
+        )
+        self.assertFalse(
+            command_matches_host_target(
+                "{} --user-data-dir={}".format(hub_bin, self.data_dir),
+                hub_bin,
+                default_hub_dir,
+            )
+        )
+
+        fake_targets = {
+            "hub": TargetInfo(
+                kind="hub",
+                display_name="Antigravity Hub",
+                app_path="/Applications/Antigravity.app",
+                binary_path=hub_bin,
+                bundle_id="com.google.antigravity",
+                version="2.32.1",
+                installed=True,
+            ),
+            "ide": TargetInfo(
+                kind="ide",
+                display_name="Antigravity IDE",
+                app_path="/Applications/Antigravity IDE.app",
+                binary_path=ide_bin,
+                bundle_id="com.google.antigravity-ide",
+                version="2.7.0",
+                installed=True,
+            ),
+        }
+        rows = [
+            {"pid": 500, "ppid": 1, "command": hub_bin},
+            {"pid": 501, "ppid": 500, "command": "/Applications/Antigravity.app/Contents/Frameworks/Helper --type=gpu-process"},
+            {"pid": 502, "ppid": 500, "command": "language_server --standalone"},
+            {"pid": 503, "ppid": 502, "command": "language_server multicall schedule CRON_TZ=UTC 0 * * * * echo one"},
+            {"pid": 504, "ppid": 502, "command": "language_server multicall schedule CRON_TZ=UTC 30 * * * * echo two"},
+            {"pid": 900, "ppid": 1, "command": "{} --user-data-dir={}".format(hub_bin, self.data_dir)},
+            {"pid": 901, "ppid": 900, "command": "language_server multicall schedule CRON_TZ=UTC 15 * * * * echo sandbox"},
+        ]
+        host_rt = inspect_host_runtime(
+            real_home=fake_home,
+            targets=fake_targets,
+            ps_rows=rows,
+            allow_default_no_flag=True,
+        )
+        self.assertEqual(host_rt["hub"]["state"], "running")
+        self.assertEqual(host_rt["hub"]["root_pids"], [500])
+        self.assertEqual(host_rt["hub"]["pids"], [500, 501, 502, 503, 504])
+        self.assertEqual(host_rt["hub"]["schedule_count"], 2)
+        self.assertEqual(host_rt["ide"]["state"], "stopped")
+        self.assertEqual(host_rt["ide"]["schedule_count"], 0)
+
+        prof_rt = inspect_locks(self.profile_dir, "hub", ps_rows=rows)
+        self.assertEqual(prof_rt["root_pids"], [900])
+        self.assertEqual(prof_rt["schedule_count"], 1)
 
     def test_inspect_and_repair_stale_locks(self) -> None:
         lock_file = self.profile_dir / "data" / "SingletonLock"

@@ -1,0 +1,12 @@
+{
+  "name": "agy-profiles",
+  "displayName": "AGY Profiles",
+  "version": "0.2.0",
+  "description": "Isolate multiple Google Antigravity Hub and IDE accounts with zero-leak .zshenv sandboxes, Automations migration, bidirectional quota handoff, and one-click switchover.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Inspect all isolated Antigravity profiles and check quota handoff readiness",
+    "Sync sanitized Host setup and paused Automations into my backup profile",
+    "Generate a cross-account handoff resume digest from recent threads"
+  ]
+}
