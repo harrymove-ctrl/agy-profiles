@@ -22,6 +22,7 @@ from agy_profiles import __version__
 from agy_profiles.config import atomic_write_json
 from agy_profiles.errors import ToolError
 from agy_profiles.process_guard import heal_electron_compositor
+from agy_profiles.quota_guard import poll_desktop_hub_auto_retry
 from agy_profiles.tools import RuntimeContext, call_tool
 
 ALLOWED_BIND_HOSTS = ("127.0.0.1", "::1")
@@ -286,6 +287,43 @@ def _unauthorized_html() -> bytes:
         "</div></body></html>"
     )
     return body.encode("utf-8")
+
+
+def _read_auto_recovery_summary(root: Path) -> Dict[str, Any]:
+    """Read persisted 5-minute auto-recovery and Rust guardian telemetry safely."""
+    summary: Dict[str, Any] = {
+        "checked_at": None,
+        "updated_at": None,
+        "resumed_total": 0,
+        "stalled_total": 0,
+        "watchdog_interval_secs": None,
+        "last_watchdog_poll_epoch": None,
+        "guard_checked_at_epoch": None,
+    }
+    wd_file = root / ".quota-watchdog.json"
+    if wd_file.is_file() and not wd_file.is_symlink():
+        try:
+            wd_data = json.loads(wd_file.read_text(encoding="utf-8"))
+            if isinstance(wd_data, dict):
+                summary["updated_at"] = wd_data.get("updated_at")
+                last_retry = wd_data.get("last_desktop_auto_retry")
+                if isinstance(last_retry, dict):
+                    summary["checked_at"] = last_retry.get("checked_at")
+                    summary["resumed_total"] = int(last_retry.get("resumed_total") or 0)
+                    summary["stalled_total"] = int(last_retry.get("stalled_total") or 0)
+        except (OSError, ValueError):
+            pass
+    tele_file = root / ".guard-telemetry.json"
+    if tele_file.is_file() and not tele_file.is_symlink():
+        try:
+            tele_data = json.loads(tele_file.read_text(encoding="utf-8"))
+            if isinstance(tele_data, dict):
+                summary["watchdog_interval_secs"] = tele_data.get("watchdog_interval_secs")
+                summary["last_watchdog_poll_epoch"] = tele_data.get("last_watchdog_poll_epoch")
+                summary["guard_checked_at_epoch"] = tele_data.get("checked_at_epoch")
+        except (OSError, ValueError):
+            pass
+    return summary
 
 
 class HardenedWebHandler(BaseHTTPRequestHandler):
@@ -575,6 +613,7 @@ class HardenedWebHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/state":
                 res = call_tool("profile_list", {}, self.state.ctx)
+                res["auto_recovery"] = _read_auto_recovery_summary(self.state.ctx.root)
                 res["server"] = {
                     "version": __version__,
                     "origin": self.state.expected_origin,
@@ -696,7 +735,12 @@ class HardenedWebHandler(BaseHTTPRequestHandler):
                     root=self.state.ctx.root,
                     real_home=self.state.ctx.real_home,
                 )
+                desktop_retry, _ = poll_desktop_hub_auto_retry(self.state.ctx)
+                res["desktop_auto_retry"] = desktop_retry
                 self._send_json(200, res)
+                return
+            if parts == ["api", "recover"]:
+                self._send_json(200, call_tool("session_recover", body, self.state.ctx))
                 return
             if parts == ["api", "profiles"]:
                 created = call_tool("profile_create", body, self.state.ctx)

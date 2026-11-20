@@ -79,6 +79,7 @@ from agy_profiles.process_guard import (
     repair_locks,
     stop_profile,
 )
+from agy_profiles.quota_guard import recover_desktop_sessions_once
 
 
 @dataclass
@@ -1747,6 +1748,59 @@ def _handle_obligations_verify(_ctx: RuntimeContext, _params: Dict[str, Any]) ->
     return report.to_dict()
 
 
+def _handle_session_recover(ctx: RuntimeContext, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Inspect Desktop Hub sessions and resume trajectories terminated by auth, model, stream, or quota errors."""
+    raw_scope = str(params.get("scope") or "all").strip() or "all"
+    if raw_scope not in ("all", "host"):
+        raw_scope = validate_profile_name(raw_scope)
+    dry_run = bool(params.get("dry_run", False))
+    reset_ledger = bool(params.get("reset_ledger", False))
+    raw_lookback = params.get("lookback_hours", 12.0)
+    try:
+        lookback_hours = float(raw_lookback)
+    except (TypeError, ValueError) as exc:
+        raise ToolError(
+            "invalid_argument",
+            "lookback_hours must be a finite number.",
+            http_status=400,
+        ) from exc
+    if lookback_hours < 0.5 or lookback_hours > 72.0:
+        raise ToolError(
+            "invalid_argument",
+            "lookback_hours must be between 0.5 and 72.0.",
+            http_status=400,
+        )
+
+    report = recover_desktop_sessions_once(
+        ctx,
+        scope=raw_scope,
+        dry_run=dry_run,
+        reset_ledger=reset_ledger,
+        lookback_hours=lookback_hours,
+    )
+    ev = EvidenceRecord(
+        operation="session_recover",
+        authority="hub-rpc-and-transcripts",
+        confidence="observed",
+        summary="Inspected Desktop Hub trajectories (scope={}, stalled={}, resumed={}, dry_run={}).".format(
+            raw_scope,
+            report.get("stalled_total", 0),
+            report.get("resumed_total", 0),
+            dry_run,
+        ),
+        facts={
+            "scope": raw_scope,
+            "dry_run": dry_run,
+            "reset_ledger": reset_ledger,
+            "lookback_hours": lookback_hours,
+            "stalled_total": report.get("stalled_total", 0),
+            "resumed_total": report.get("resumed_total", 0),
+        },
+        limitations=["Requires a reachable Antigravity Desktop Hub language_server process for live RPC recovery."],
+    )
+    return {**report, "evidence": ev.to_dict()}
+
+
 TOOL_SPECS: List[ToolSpec] = [
     ToolSpec(
         name="profile_list",
@@ -2010,6 +2064,22 @@ TOOL_SPECS: List[ToolSpec] = [
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         handler=_handle_obligations_verify,
         mutates=False,
+    ),
+    ToolSpec(
+        name="session_recover",
+        description="Inspect running Antigravity Desktop Hub instances for conversations terminated by auth logout/login, model lookup, stream, or quota errors and automatically resume them.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "scope": {"type": "string", "default": "all"},
+                "dry_run": {"type": "boolean", "default": False},
+                "reset_ledger": {"type": "boolean", "default": False},
+                "lookback_hours": {"type": "number", "minimum": 0.5, "maximum": 72.0, "default": 12.0},
+            },
+            "additionalProperties": False,
+        },
+        handler=_handle_session_recover,
+        mutates=True,
     ),
 ]
 

@@ -4,12 +4,26 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agy-profiles"
-version = "0.1.0"
-description = "Clean-room multi-profile sandbox manager, stdio MCP server, and CSRF-hardened local console for Google Antigravity"
+version = "0.3.0"
+description = "Multi-account sandbox, 24/7 Rust watchdog (dev.agy-profiles.watchdog), 5m post-login session auto-recovery, black-screen healer, and 18-tool MCP server for Google Antigravity on macOS"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = []
+keywords = [
+  "google-antigravity",
+  "antigravity",
+  "antigravity-cli",
+  "mcp",
+  "watchdog",
+  "agent-recovery",
+  "agent-safety",
+  "multi-account",
+  "sandbox",
+  "macos",
+  "launchd",
+  "acp"
+]
 authors = [
   { name = "harrymove-ctrl" }
 ]

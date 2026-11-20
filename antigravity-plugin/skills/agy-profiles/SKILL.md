@@ -1,6 +1,6 @@
 ---
 name: agy-profiles
-description: Provision, inspect, sync, switch, hand off, launch, stop, repair, clone, rename, and audit isolated Google Antigravity Hub and IDE sandbox profiles via the clean-room agy-profiles CLI or 17-tool stdio MCP server.
+description: Provision, inspect, sync, switch, hand off, launch, stop, repair, clone, rename, recover, and audit isolated Google Antigravity Hub and IDE sandbox profiles via the clean-room agy-profiles CLI or 18-tool stdio MCP server.
 ---
 
 # agy-profiles Operator Skill
@@ -37,9 +37,11 @@ Use this skill when isolating Google Antigravity workspaces, debugging stale Chr
 6. Stop cleanly or repair stale locks when finished:
    `agy-profiles stop work-backup --target all --json`
    `agy-profiles repair work-backup --json`
-7. Keep the 24/7 macOS `launchd` services (`agyp-guard` native Rust CPU/GPU/PID guardian wrapped in `/usr/bin/caffeinate -i` plus the persistent Web Console on `127.0.0.1:47920`) active across overnight or multi-day unattended runs:
+7. Keep the 24/7 macOS `launchd` services (`agyp-guard` native Rust CPU/GPU/PID guardian and 5-minute Desktop Hub recovery watchdog wrapped in `/usr/bin/caffeinate -i`, plus the persistent Web Console on `127.0.0.1:47920`) active across overnight or multi-day unattended runs, or invoke `session_recover` / `agyp recover` after an account logout/login:
    `agyp daemon install --json`
    `agyp daemon status --json`
+   `agyp recover --dry-run --json`
+   `agyp recover --reset-ledger --json`
    `agyp guard once --json`
    `agyp heal all --json`
    `agyp daemon open`

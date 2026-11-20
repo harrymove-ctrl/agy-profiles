@@ -41,6 +41,7 @@ from agy_profiles.process_guard import heal_electron_compositor
 from agy_profiles.quota_guard import (
     host_quota_log_paths,
     poll_auto_failover_once,
+    poll_desktop_hub_auto_retry,
     scan_new_log_bytes_for_quota_exhaustion,
     snapshot_log_offsets,
 )
@@ -393,11 +394,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p_wd = sub.add_parser(
         "watchdog",
         parents=[common_sub],
-        help="Monitor Host Antigravity logs and automatically switch quota onto backup profile when exhausted.",
+        help="Monitor Host Antigravity logs, auto-resume Desktop Hub 5-hour quota stalls, and switch onto backup profile when exhausted.",
     )
     p_wd.add_argument("--interval", type=float, default=5.0, help="Polling interval in seconds (default: 5.0).")
-    p_wd.add_argument("--once", action="store_true", default=False, help="Run a single quota check and exit.")
+    p_wd.add_argument("--once", action="store_true", default=False, help="Run a single quota and Desktop Hub auto-retry check and exit.")
     p_wd.add_argument("--no-launch", action="store_true", default=False, help="Switch setup and crons without opening GUI.")
+    p_wd.add_argument(
+        "--failover-on-5h",
+        action="store_true",
+        default=True,
+        dest="failover_on_5h",
+        help="Switch onto standby backup profile when Host 5-hour quota reaches zero (default: enabled).",
+    )
+    p_wd.add_argument(
+        "--no-failover-on-5h",
+        action="store_false",
+        dest="failover_on_5h",
+        help="Keep Host active when only the 5-hour quota reaches zero.",
+    )
 
     p_daemon = sub.add_parser(
         "daemon",
@@ -460,6 +474,41 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Also recycle frozen renderer helpers while keeping root Electron, language_server, and terminals alive.",
+    )
+
+    p_recover = sub.add_parser(
+        "recover",
+        parents=[common_sub],
+        help="Inspect Desktop Hub trajectories for auth, model, stream, or quota termination errors and resume them.",
+    )
+    p_recover.add_argument(
+        "--once",
+        action="store_true",
+        default=False,
+        help="Run a single recovery pass and exit (default behavior).",
+    )
+    p_recover.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Inspect stalled or errored conversations without dispatching continuation messages.",
+    )
+    p_recover.add_argument(
+        "--scope",
+        default="all",
+        help="Scope to recover: all (default), host, or a profile slug.",
+    )
+    p_recover.add_argument(
+        "--reset-ledger",
+        action="store_true",
+        default=False,
+        help="Clear prior retry attempts so stalled conversations retry immediately.",
+    )
+    p_recover.add_argument(
+        "--lookback-hours",
+        type=float,
+        default=12.0,
+        help="Lookback window in hours for idle trajectories (default: 12.0).",
     )
 
     return parser
@@ -681,6 +730,27 @@ def _print_human(command: str, data: Dict[str, Any]) -> None:
         print("Ledger {}: {}/{} closed, {} failed".format(data["ledger_id"], s["closed"], s["total"], s["failed"]))
         for item in data["items"]:
             print("[{:<6}] {:<32} ({})".format(item["status"].upper(), item["obligation_id"], item["owner_module"]))
+        return
+
+    if command == "recover":
+        print(
+            "Session recovery ({}): stalled={} resumed={} dry_run={}".format(
+                data.get("checked_at") or "now",
+                data.get("stalled_total", 0),
+                data.get("resumed_total", 0),
+                bool(data.get("dry_run")),
+            )
+        )
+        for item in data.get("resumed_conversations") or []:
+            print(
+                "  resumed [{}] {} ({}) via {} ({})".format(
+                    item.get("scope"),
+                    item.get("title") or item.get("cascade_id"),
+                    item.get("stall_kind"),
+                    item.get("plan_model"),
+                    item.get("mode"),
+                )
+            )
         return
 
     print(json.dumps(data, indent=2))
@@ -1192,11 +1262,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                 root=ctx.root,
                 real_home=ctx.real_home,
             )
+            desktop_retry, _ = poll_desktop_hub_auto_retry(ctx)
+            h_res["desktop_auto_retry"] = desktop_retry
             if args.as_json:
                 print(json.dumps(h_res, indent=2))
             else:
                 print(
-                    "Healed Antigravity compositor (scope={}, target={}, deep={}): recycled_gpu={} recycled_renderers={} preserved_roots={} cleared_caches={}".format(
+                    "Healed Antigravity compositor (scope={}, target={}, deep={}): recycled_gpu={} recycled_renderers={} preserved_roots={} cleared_caches={} resumed_conversations={}".format(
                         h_res["scope"],
                         h_res["target"],
                         h_res["deep"],
@@ -1204,6 +1276,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         len(h_res["recycled_renderer_pids"]),
                         len(h_res["preserved_root_pids"]),
                         len(h_res["cleared_shader_caches"]),
+                        desktop_retry.get("resumed_total", 0),
                     )
                 )
             return 0
@@ -1211,8 +1284,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         if cmd == "watchdog":
             interval_s = max(1.0, float(args.interval))
             do_launch = not bool(args.no_launch)
+            do_5h_failover = bool(getattr(args, "failover_on_5h", False))
             if args.once:
-                wd_res = poll_auto_failover_once(ctx, call_tool, launch=do_launch)
+                wd_res = poll_auto_failover_once(
+                    ctx,
+                    call_tool,
+                    launch=do_launch,
+                    failover_on_5h=do_5h_failover,
+                )
                 if args.as_json:
                     print(json.dumps(wd_res, indent=2))
                 elif wd_res.get("switched_to"):
@@ -1223,10 +1302,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         )
                     )
                 else:
+                    resumed_cnt = int((wd_res.get("desktop_auto_retry") or {}).get("resumed_total") or 0)
                     print(
-                        "Quota watchdog OK (owner={}, initialized={}).".format(
+                        "Quota watchdog OK (owner={}, initialized={}, desktop_resumed={}).".format(
                             wd_res.get("active_owner_before"),
                             wd_res.get("initialized"),
+                            resumed_cnt,
                         )
                     )
                 return 0
@@ -1240,13 +1321,29 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             try:
                 while True:
-                    wd_res = poll_auto_failover_once(ctx, call_tool, launch=do_launch)
+                    wd_res = poll_auto_failover_once(
+                        ctx,
+                        call_tool,
+                        launch=do_launch,
+                        failover_on_5h=do_5h_failover,
+                    )
                     if wd_res.get("switched_to"):
                         print(
                             "[{}] Auto-switched quota onto '{}' ({})".format(
                                 wd_res["checked_at"],
                                 wd_res["switched_to"],
                                 wd_res.get("reason") or "exhausted",
+                            ),
+                            flush=True,
+                        )
+                    resumed_list = (wd_res.get("desktop_auto_retry") or {}).get("resumed_conversations") or []
+                    for r_item in resumed_list:
+                        print(
+                            "[{}] Auto-resumed Desktop Hub conversation '{}' ({}) on {}".format(
+                                wd_res["checked_at"],
+                                r_item.get("title") or r_item.get("cascade_id"),
+                                r_item.get("stall_kind"),
+                                r_item.get("scope"),
                             ),
                             flush=True,
                         )
@@ -1455,6 +1552,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             result = call_tool("system_doctor", {}, ctx)
         elif cmd == "obligations":
             result = call_tool("obligations_verify", {}, ctx)
+        elif cmd == "recover":
+            result = call_tool(
+                "session_recover",
+                {
+                    "scope": args.scope,
+                    "dry_run": bool(args.dry_run),
+                    "reset_ledger": bool(args.reset_ledger),
+                    "lookback_hours": float(args.lookback_hours),
+                },
+                ctx,
+            )
         else:
             raise ToolError("invalid_argument", "Unknown command {!r}.".format(cmd))
 

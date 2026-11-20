@@ -274,6 +274,7 @@ interface HostPrimaryDetailViewProps {
   ) => Promise<void>;
   onSwitch: (name: string) => Promise<void>;
   onReturnHost: (fromProfile: string) => Promise<void>;
+  onRepairHost: () => Promise<void>;
   onOpenHandoff: () => void;
 }
 
@@ -288,6 +289,7 @@ function HostPrimaryDetailView({
   onSync,
   onSwitch,
   onReturnHost,
+  onRepairHost,
   onOpenHandoff,
 }: HostPrimaryDetailViewProps) {
   const fallbackHub: TargetRuntime = {
@@ -409,6 +411,15 @@ function HostPrimaryDetailView({
                     onClick={() =>
                       void onSync(primaryBackup.manifest.name, false, "paused")
                     }
+                  />
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    label="Repair Host"
+                    tooltip="Restart Main Antigravity Hub cleanly to restore localhost Language Server TLS trust"
+                    isDisabled={actionBusy !== null || syncBusy !== null}
+                    isLoading={actionBusy === "repair"}
+                    onClick={() => void onRepairHost()}
                   />
                   <Button
                     size="sm"
@@ -713,6 +724,7 @@ export function ProfilesDetailPane({
         onSync={onSync}
         onSwitch={onSwitch}
         onReturnHost={onReturnHost}
+        onRepairHost={() => onRepair("host")}
         onOpenHandoff={onOpenHandoff}
       />
     );

@@ -128,8 +128,11 @@ def _can_mutate_host_launchd(ctx: RuntimeContext, dry_run: bool) -> bool:
     if ctx.real_home is None:
         return True
     try:
-        return Path(ctx.real_home).resolve() == Path.home().resolve()
-    except OSError:
+        import pwd
+
+        os_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        return Path(ctx.real_home).resolve() == os_home
+    except (KeyError, OSError):
         return False
 
 
@@ -217,7 +220,15 @@ def ensure_rust_guard_binary(ctx: RuntimeContext, dry_run: bool = False) -> Opti
                 os.chmod(str(tmp_dst), 0o755)
                 if os.path.isfile("/usr/bin/codesign"):
                     subprocess.run(
-                        ["/usr/bin/codesign", "--force", "--sign", "-", str(tmp_dst)],
+                        [
+                            "/usr/bin/codesign",
+                            "--force",
+                            "--sign",
+                            "-",
+                            "--identifier",
+                            "dev.agy-profiles.agyp-guard",
+                            str(tmp_dst),
+                        ],
                         capture_output=True,
                         timeout=10,
                         check=False,

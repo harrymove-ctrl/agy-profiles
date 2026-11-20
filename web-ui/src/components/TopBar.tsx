@@ -31,9 +31,11 @@ export interface TopBarProps {
   isDarkOnlyTheme: boolean;
   resolvedMode: "light" | "dark";
   healBusy?: boolean;
+  recoverBusy?: boolean;
   onViewChange: (view: AppView) => void;
   onThemeChange: (slug: ThemeSlug) => void;
   onToggleColorMode: () => void;
+  onRecoverSessions: () => void;
   onHealScreen: () => void;
   onOpenCreate: () => void;
 }
@@ -50,9 +52,11 @@ export function TopBar({
   isDarkOnlyTheme,
   resolvedMode,
   healBusy = false,
+  recoverBusy = false,
   onViewChange,
   onThemeChange,
   onToggleColorMode,
+  onRecoverSessions,
   onHealScreen,
   onOpenCreate,
 }: TopBarProps) {
@@ -136,6 +140,14 @@ export function TopBar({
               onClick={onToggleColorMode}
             />
           ) : null}
+          <Button
+            size="sm"
+            variant="secondary"
+            label={recoverBusy ? "Recovering..." : "Recover"}
+            tooltip="Check all Desktop Hub trajectories and resume sessions terminated by auth or model errors"
+            isDisabled={recoverBusy}
+            onClick={onRecoverSessions}
+          />
           <Button
             size="sm"
             variant="secondary"

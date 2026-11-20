@@ -35,6 +35,7 @@ import type {
   OverviewResponse,
   ProfileDetail,
   ProfileFilter,
+  RecoverSessionsResponse,
   RenameProfilePayload,
   ReturnHostSwitchResponse,
   SwitchProfileResponse,
@@ -623,10 +624,13 @@ function ConsoleShell({
         body: {},
       });
       toast({
-        body: `Repaired locks and permissions for ${name}.`,
+        body:
+          name === "host"
+            ? "Repaired and relaunched Main Antigravity Hub."
+            : `Repaired locks and permissions for ${name}.`,
         type: "info",
       });
-      await refreshState(name);
+      await refreshState(name === "host" ? HOST_SELECTION_ID : name);
     } catch (err) {
       reportError(err, `Failed to repair ${name}.`);
     } finally {
@@ -711,12 +715,40 @@ function ConsoleShell({
       const gpuCount = res.recycled_gpu_pids.length;
       const cacheCount = res.cleared_shader_caches.length;
       toast({
-        body: `Healed Antigravity compositor (${gpuCount} GPU ${pluralize(gpuCount, "helper")}, ${cacheCount} shader ${pluralize(cacheCount, "cache")} cleared) with zero sessions stopped.`,
+        body: res.host_hub_repaired
+          ? "Repaired Main Antigravity Hub TLS connection and recycled GPU compositors."
+          : `Healed Antigravity compositor (${gpuCount} GPU ${pluralize(gpuCount, "helper")}, ${cacheCount} shader ${pluralize(cacheCount, "cache")} cleared) with zero sessions stopped.`,
         type: "info",
       });
       await refreshState(selectedName);
     } catch (err) {
       reportError(err, "Failed to heal Antigravity screen.");
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const handleRecoverSessions = async () => {
+    setActionBusy("recover");
+    try {
+      const res = await apiFetch<RecoverSessionsResponse>("/api/recover", {
+        method: "POST",
+        body: { scope: "all", reset_ledger: true },
+      });
+      const resumed = res.resumed_total ?? 0;
+      const stalled = res.stalled_total ?? 0;
+      toast({
+        body:
+          resumed > 0
+            ? `Recovered ${resumed} stalled ${pluralize(resumed, "session")} across Antigravity Hubs.`
+            : stalled > 0
+              ? `Detected ${stalled} stalled ${pluralize(stalled, "session")} awaiting account quota or model sync.`
+              : "All Antigravity sessions healthy (0 stalled).",
+        type: "info",
+      });
+      await refreshState(selectedName);
+    } catch (err) {
+      reportError(err, "Failed to recover Antigravity sessions.");
     } finally {
       setActionBusy(null);
     }
@@ -744,9 +776,11 @@ function ConsoleShell({
             isDarkOnlyTheme={isDarkOnlyTheme}
             resolvedMode={resolvedMode}
             healBusy={actionBusy === "heal"}
+            recoverBusy={actionBusy === "recover"}
             onViewChange={handleViewChange}
             onThemeChange={onThemeChange}
             onToggleColorMode={onToggleColorMode}
+            onRecoverSessions={() => void handleRecoverSessions()}
             onHealScreen={() => void handleHealScreen()}
             onOpenCreate={() => setCreateOpen(true)}
           />

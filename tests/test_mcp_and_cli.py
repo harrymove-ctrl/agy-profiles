@@ -74,7 +74,8 @@ class McpAndCliTests(unittest.TestCase):
         self.assertIn("profile_switch", tool_names)
         self.assertIn("profile_rename", tool_names)
         self.assertIn("host_handoff", tool_names)
-        self.assertGreaterEqual(len(tool_names), 17)
+        self.assertIn("session_recover", tool_names)
+        self.assertGreaterEqual(len(tool_names), 18)
 
         create_payload = json.loads(responses[2]["result"]["content"][0]["text"])
         self.assertFalse(responses[2]["result"].get("isError", False))
@@ -900,6 +901,654 @@ class McpAndCliTests(unittest.TestCase):
         self.assertEqual(repaired["profile"], "host")
         self.assertIn("SingletonLock", repaired["locks_removed"]["hub"])
         self.assertFalse(stale_lock.exists())
+
+    def test_desktop_hub_five_hour_quota_auto_retry_and_bypass(self) -> None:
+        from agy_profiles.quota_guard import (
+            find_stalled_desktop_conversations,
+            parse_quota_summary_buckets,
+            poll_desktop_hub_auto_retry,
+        )
+
+        # 1. Verify 5-hour quota bucket parsing when Weekly > 0 and 5h == 0 vs 5h > 0
+        user_status_resp = {
+            "userStatus": {
+                "email": "user@example.com",
+                "userTier": {"name": "Google AI Pro"},
+                "cascadeModelConfigData": {
+                    "defaultOverrideModelConfig": {"modelOrAlias": {"model": "MODEL_PLACEHOLDER_M427"}}
+                },
+            }
+        }
+        quota_exhausted_5h = {
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-weekly",
+                                "displayName": "Weekly Limit Remaining",
+                                "window": "weekly",
+                                "remainingFraction": 0.52,
+                                "resetTime": "2026-11-22T05:00:00Z",
+                            },
+                            {
+                                "bucketId": "gemini-5h",
+                                "displayName": "Five Hour Limit Remaining",
+                                "window": "5h",
+                                "remainingFraction": 0.0,
+                                "resetTime": "2026-11-17T14:00:00Z",
+                            },
+                        ],
+                    }
+                ]
+            }
+        }
+        parsed_paused = parse_quota_summary_buckets(quota_exhausted_5h, user_status_resp)
+        self.assertTrue(parsed_paused["five_hour_exhausted_while_weekly_available"])
+        self.assertFalse(parsed_paused["weekly_exhausted"])
+        self.assertFalse(parsed_paused["can_dispatch_now"])
+
+        quota_exhausted_weekly = {
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-weekly",
+                                "displayName": "Weekly Limit Remaining",
+                                "window": "weekly",
+                                "remainingFraction": 0.0,
+                                "resetTime": "2026-11-22T05:00:00Z",
+                            },
+                            {
+                                "bucketId": "gemini-5h",
+                                "displayName": "Five Hour Limit Remaining",
+                                "window": "5h",
+                                "remainingFraction": 1.0,
+                                "resetTime": "2026-11-17T14:00:00Z",
+                            },
+                        ],
+                    }
+                ]
+            }
+        }
+        parsed_weekly = parse_quota_summary_buckets(quota_exhausted_weekly, user_status_resp)
+        self.assertTrue(parsed_weekly["weekly_exhausted"])
+        self.assertFalse(parsed_weekly["can_dispatch_now"])
+
+        # When Argon bucket still has balance, dispatch switches to MODEL_PLACEHOLDER_M417 immediately
+        quota_with_argon = {
+            "response": {
+                "groups": [
+                    quota_exhausted_5h["response"]["groups"][0],
+                    {
+                        "displayName": "Gemini 4 Argon",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-argon-wtu-weekly",
+                                "displayName": "Gemini 4 Argon Weekly Limit",
+                                "window": "weekly",
+                                "remainingFraction": 0.85,
+                                "resetTime": "2026-11-22T05:00:00Z",
+                            }
+                        ],
+                    },
+                ]
+            }
+        }
+        parsed_argon = parse_quota_summary_buckets(quota_with_argon, user_status_resp)
+        self.assertTrue(parsed_argon["can_dispatch_now"])
+        self.assertEqual(parsed_argon["preferred_plan_model"], "MODEL_PLACEHOLDER_M417")
+
+        # 2. Create transcripts for (a) completed conversation, (b) user-canceled conversation,
+        # (c) healthy swarm_wait conversation, (d) stalled 5h quota swarm coordinator, (e) stalled stream timeout
+        brain_dir = self.fake_home / ".gemini" / "antigravity" / "brain"
+        def _write_transcript(cid: str, lines: list[dict]) -> None:
+            t_dir = brain_dir / cid / ".system_generated" / "logs"
+            t_dir.mkdir(parents=True, exist_ok=True)
+            (t_dir / "transcript.jsonl").write_text(
+                "\n".join(json.dumps(x) for x in lines) + "\n",
+                encoding="utf-8",
+            )
+
+        _write_transcript(
+            "conv-done",
+            [{"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "content": "All done."}],
+        )
+        _write_transcript(
+            "conv-canceled",
+            [{"step_index": 1, "source": "SYSTEM", "type": "ERROR_MESSAGE", "status": "DONE", "error": "Canceled"}],
+        )
+        _write_transcript(
+            "conv-swarm-waiting",
+            [
+                {
+                    "step_index": 10,
+                    "source": "MODEL",
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "Waiting for a message that calls on you by name, or on @all posted after #117.",
+                }
+            ],
+        )
+        _write_transcript(
+            "conv-quota-stalled",
+            [
+                {
+                    "step_index": 12,
+                    "source": "SYSTEM",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "content": "The subagent worker encountered an error: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 2h.",
+                },
+                {
+                    "step_index": 13,
+                    "source": "SYSTEM_SDK",
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "content": "PreInvocation hook",
+                },
+            ],
+        )
+        _write_transcript(
+            "conv-stream-timeout",
+            [
+                {
+                    "step_index": 5,
+                    "source": "SYSTEM",
+                    "type": "ERROR_MESSAGE",
+                    "status": "DONE",
+                    "error": "API error (attempt 1): request failed: stream idle timeout (5m0s): context deadline exceeded",
+                }
+            ],
+        )
+
+        summaries = {
+            "conv-done": {
+                "summary": "Finished Task",
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "stepCount": 2,
+                "lastModifiedTime": "2026-11-17T10:00:00Z",
+                "latestExecutorTerminationReason": "EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL",
+            },
+            "conv-canceled": {
+                "summary": "Canceled Task",
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "stepCount": 2,
+                "lastModifiedTime": "2026-11-17T10:00:00Z",
+                "latestExecutorTerminationReason": "EXECUTOR_TERMINATION_REASON_USER_CANCELED",
+            },
+            "conv-swarm-waiting": {
+                "summary": "Swarm Waiting",
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "stepCount": 11,
+                "lastModifiedTime": "2026-11-17T10:00:00Z",
+                "latestExecutorTerminationReason": "EXECUTOR_TERMINATION_REASON_TERMINAL_CUSTOM_HOOK",
+            },
+            "conv-quota-stalled": {
+                "summary": "Overnight Swarm Coordinator",
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "stepCount": 14,
+                "lastModifiedTime": "2026-11-17T10:05:00Z",
+                "latestExecutorTerminationReason": "EXECUTOR_TERMINATION_REASON_TERMINAL_CUSTOM_HOOK",
+            },
+            "conv-stream-timeout": {
+                "summary": "Overnight Feature Build",
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "stepCount": 6,
+                "lastModifiedTime": "2026-11-17T10:04:00Z",
+                "latestExecutorTerminationReason": "EXECUTOR_TERMINATION_REASON_ERROR",
+            },
+        }
+
+        now_epoch = 1794910200.0  # 2026-11-17T10:10:00Z
+        stalled = find_stalled_desktop_conversations(summaries, brain_dir, now_epoch=now_epoch)
+        self.assertEqual([c["cascade_id"] for c in stalled], ["conv-quota-stalled", "conv-stream-timeout"])
+        self.assertTrue(stalled[0]["needs_prompt_bypass"])
+        self.assertFalse(stalled[1]["needs_prompt_bypass"])
+
+        # 3. Verify poll_desktop_hub_auto_retry dispatches SendUserCascadeMessage once 5h quota refreshes
+        quota_refreshed_5h = {
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-weekly",
+                                "displayName": "Weekly Limit Remaining",
+                                "window": "weekly",
+                                "remainingFraction": 0.52,
+                                "resetTime": "2026-11-22T05:00:00Z",
+                            },
+                            {
+                                "bucketId": "gemini-5h",
+                                "displayName": "Five Hour Limit Remaining",
+                                "window": "5h",
+                                "remainingFraction": 0.29,
+                                "resetTime": "2026-11-17T14:00:00Z",
+                            },
+                        ],
+                    }
+                ]
+            }
+        }
+        sent_rpcs: list[tuple[int, str, str, dict]] = []
+
+        def _fake_rpc(port: int, token: str, method: str, body: dict | None = None) -> dict:
+            if method == "GetUserStatus":
+                return user_status_resp
+            if method == "RetrieveUserQuotaSummary":
+                return quota_refreshed_5h
+            if method == "GetAllCascadeTrajectories":
+                return {"trajectorySummaries": summaries}
+            if method == "SendUserCascadeMessage":
+                sent_rpcs.append((port, token, method, body or {}))
+                return {}
+            return {}
+
+        fake_ps = [
+            {
+                "pid": 2001,
+                "ppid": 1,
+                "pgid": 2001,
+                "command": "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+            },
+            {
+                "pid": 2002,
+                "ppid": 2001,
+                "pgid": 2001,
+                "command": "/Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone --subclient_type hub --csrf_token tok-host-123",
+            },
+        ]
+
+        from unittest import mock
+        with mock.patch("agy_profiles.quota_guard._resolve_port_from_devtools_file", return_value=50368):
+            report1, ledger1 = poll_desktop_hub_auto_retry(
+                self.ctx,
+                ledger={},
+                ps_rows=fake_ps,
+                rpc_caller=_fake_rpc,
+                now_epoch=now_epoch,
+            )
+            self.assertEqual(report1["resumed_total"], 2)
+            self.assertEqual(len(sent_rpcs), 2)
+            # First stalled conversation (quota_pause custom hook) receives continuation prompt
+            self.assertEqual(sent_rpcs[0][3]["cascadeId"], "conv-quota-stalled")
+            self.assertEqual(len(sent_rpcs[0][3]["items"]), 1)
+            # Second stalled conversation (stream timeout error) receives empty retry payload first
+            self.assertEqual(sent_rpcs[1][3]["cascadeId"], "conv-stream-timeout")
+            self.assertEqual(sent_rpcs[1][3]["items"], [])
+
+            # Immediate re-poll within cooldown does not duplicate SendUserCascadeMessage
+            report2, _ = poll_desktop_hub_auto_retry(
+                self.ctx,
+                ledger=ledger1,
+                ps_rows=fake_ps,
+                rpc_caller=_fake_rpc,
+                now_epoch=now_epoch + 10.0,
+            )
+            self.assertEqual(report2["resumed_total"], 0)
+            self.assertEqual(len(sent_rpcs), 2)
+
+    def test_rpc_hidden_executor_error_recovery_and_auth_reset(self) -> None:
+        from unittest import mock
+
+        from agy_profiles.quota_guard import (
+            MAX_ATTEMPTS_PER_STALL,
+            parse_quota_summary_buckets,
+            poll_desktop_hub_auto_retry,
+            recover_desktop_sessions_once,
+        )
+
+        brain_dir = self.fake_home / ".gemini" / "antigravity" / "brain"
+
+        def _write_transcript(cid: str, lines: list[dict]) -> None:
+            t_dir = brain_dir / cid / ".system_generated" / "logs"
+            t_dir.mkdir(parents=True, exist_ok=True)
+            (t_dir / "transcript.jsonl").write_text(
+                "\n".join(json.dumps(x) for x in lines) + "\n",
+                encoding="utf-8",
+            )
+
+        conv_main = "6b29f77a-c6b2-4d37-91d5-e85985f45998"
+        conv_missing_model = "424ed305-485d-4729-9193-44dc7e74dd4e"
+
+        _write_transcript(
+            conv_main,
+            [
+                {
+                    "step_index": 7638,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "Hold flat.",
+                }
+            ],
+        )
+        _write_transcript(
+            conv_missing_model,
+            [
+                {
+                    "step_index": 2600,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "Ready.",
+                }
+            ],
+        )
+
+        summaries = {
+            conv_main: {
+                "summary": "Trading Hub",
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "stepCount": 7640,
+                "lastModifiedTime": "2026-11-20T04:45:42Z",
+                "latestExecutorTerminationReason": "EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL",
+            },
+            conv_missing_model: {
+                "summary": "Backup Hub",
+                "status": "CASCADE_RUN_STATUS_IDLE",
+                "stepCount": 2602,
+                "lastModifiedTime": "2026-11-20T04:45:40Z",
+                "latestExecutorTerminationReason": "EXECUTOR_TERMINATION_REASON_NO_TOOL_CALL",
+            },
+        }
+
+        quota_ok = {
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-weekly",
+                                "displayName": "Weekly Limit Remaining",
+                                "window": "weekly",
+                                "remainingFraction": 0.25,
+                                "resetTime": "2026-11-22T05:00:00Z",
+                            },
+                            {
+                                "bucketId": "gemini-5h",
+                                "displayName": "Five Hour Limit Remaining",
+                                "window": "5h",
+                                "remainingFraction": 1.0,
+                                "resetTime": "2026-11-20T09:45:00Z",
+                            },
+                        ],
+                    }
+                ]
+            }
+        }
+
+        # 1. Mid-login window: clientModelConfigs is empty -> models_loaded False -> 0 dispatches
+        mid_login_status = {
+            "userStatus": {
+                "email": "old@example.com",
+                "cascadeModelConfigData": {
+                    "defaultOverrideModelConfig": {"modelOrAlias": {"model": "MODEL_PLACEHOLDER_M532"}},
+                    "clientModelConfigs": [],
+                },
+            }
+        }
+        parsed_mid = parse_quota_summary_buckets(quota_ok, mid_login_status)
+        self.assertFalse(parsed_mid["models_loaded"])
+        self.assertFalse(parsed_mid["can_dispatch_now"])
+
+        # Put Opus M26 first to ensure fallback never selects unavailable/disallowed Opus M26.
+        ready_status = {
+            "userStatus": {
+                "email": "old@example.com",
+                "cascadeModelConfigData": {
+                    "defaultOverrideModelConfig": {"modelOrAlias": {"model": "MODEL_PLACEHOLDER_M669"}},
+                    "clientModelConfigs": [
+                        {
+                            "label": "Claude Opus 4.6",
+                            "modelOrAlias": {"model": "MODEL_PLACEHOLDER_M26"},
+                            "quotaInfo": {"remainingFraction": 0.9},
+                        },
+                        {
+                            "label": "Gemini 4 Neon (High)",
+                            "modelOrAlias": {"model": "MODEL_PLACEHOLDER_M532"},
+                            "quotaInfo": {"remainingFraction": 0.25},
+                        },
+                    ],
+                },
+            }
+        }
+        parsed_ready = parse_quota_summary_buckets(quota_ok, ready_status)
+        self.assertTrue(parsed_ready["models_loaded"])
+        self.assertTrue(parsed_ready["can_dispatch_now"])
+        self.assertEqual(parsed_ready["preferred_plan_model"], "MODEL_PLACEHOLDER_M532")
+
+        fake_ps = [
+            {
+                "pid": 3001,
+                "ppid": 1,
+                "pgid": 3001,
+                "command": "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+            },
+            {
+                "pid": 3002,
+                "ppid": 3001,
+                "pgid": 3001,
+                "command": "/Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone --subclient_type hub --csrf_token tok-host-999",
+            },
+        ]
+
+        state_box = {"user_status": mid_login_status}
+        sent_rpcs: list[dict] = []
+
+        def _fake_rpc(_port: int, _token: str, method: str, body: dict | None = None) -> dict:
+            if method == "GetUserStatus":
+                return state_box["user_status"]
+            if method == "RetrieveUserQuotaSummary":
+                return quota_ok
+            if method == "GetAllCascadeTrajectories":
+                return {"trajectorySummaries": summaries}
+            if method == "GetCascadeTrajectorySteps":
+                cid = (body or {}).get("cascadeId")
+                if cid == conv_main:
+                    return {
+                        "steps": [
+                            {
+                                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                                "status": "CORTEX_STEP_STATUS_DONE",
+                                "metadata": {
+                                    "generatorModel": "MODEL_PLACEHOLDER_M532",
+                                    "sourceTrajectoryStepInfo": {"stepIndex": 7638},
+                                },
+                            },
+                            {
+                                "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+                                "status": "CORTEX_STEP_STATUS_DONE",
+                                "errorMessage": {
+                                    "error": {
+                                        "userErrorMessage": "Agent execution terminated due to error.",
+                                        "shortError": "failed to construct executor: unknown model key MODEL_PLACEHOLDER_M532: model not found",
+                                    }
+                                },
+                            },
+                        ]
+                    }
+                if cid == conv_missing_model:
+                    return {
+                        "steps": [
+                            {
+                                "type": "CORTEX_STEP_TYPE_PLANNER_RESPONSE",
+                                "status": "CORTEX_STEP_STATUS_DONE",
+                                "metadata": {
+                                    "generatorModel": "MODEL_PLACEHOLDER_M669",
+                                    "sourceTrajectoryStepInfo": {"stepIndex": 2600},
+                                },
+                            },
+                            {
+                                "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+                                "status": "CORTEX_STEP_STATUS_DONE",
+                                "errorMessage": {
+                                    "error": {
+                                        "shortError": "failed to construct executor: unknown model key MODEL_PLACEHOLDER_M669: model not found",
+                                    }
+                                },
+                            },
+                        ]
+                    }
+            if method == "SendUserCascadeMessage":
+                sent_rpcs.append(body or {})
+                return {}
+            return {}
+
+        now_epoch = 1795150000.0  # 2026-11-20T04:46:40Z (58s after crash)
+        with mock.patch("agy_profiles.quota_guard._resolve_port_from_devtools_file", return_value=50368):
+            rep_mid, ledger = poll_desktop_hub_auto_retry(
+                self.ctx,
+                ledger={},
+                ps_rows=fake_ps,
+                rpc_caller=_fake_rpc,
+                now_epoch=now_epoch,
+            )
+            self.assertEqual(rep_mid["stalled_total"], 2)
+            self.assertEqual(rep_mid["resumed_total"], 0)
+
+            # 2. Models finish loading -> auth transition triggers immediate recovery with continuation prompt
+            state_box["user_status"] = ready_status
+            rep_ready, ledger = poll_desktop_hub_auto_retry(
+                self.ctx,
+                ledger=ledger,
+                ps_rows=fake_ps,
+                rpc_caller=_fake_rpc,
+                now_epoch=now_epoch + 5.0,
+            )
+            self.assertEqual(rep_ready["resumed_total"], 2)
+            self.assertTrue(rep_ready["hubs_inspected"][0]["auth_refreshed"])
+            self.assertEqual(len(sent_rpcs), 2)
+            for payload in sent_rpcs:
+                self.assertEqual(len(payload["items"]), 1)
+                self.assertIn("/schedule timers", payload["items"][0]["text"])
+                self.assertEqual(payload["cascadeConfig"]["plannerConfig"]["planModel"], "MODEL_PLACEHOLDER_M532")
+
+            # 3. Anti-retry-storm: bumping stepCount without advancing last_good_step within 300s is skipped
+            summaries[conv_main]["stepCount"] = 7642
+            rep_storm, ledger = poll_desktop_hub_auto_retry(
+                self.ctx,
+                ledger=ledger,
+                ps_rows=fake_ps,
+                rpc_caller=_fake_rpc,
+                now_epoch=now_epoch + 65.0,
+            )
+            self.assertEqual(rep_storm["resumed_total"], 0)
+            self.assertEqual(len(sent_rpcs), 2)
+
+            # 4. After 300s cooldown, attempt 2 fires; up to MAX_ATTEMPTS_PER_STALL (5)
+            t_cur = now_epoch + 5.0
+            for expected_attempt in range(2, MAX_ATTEMPTS_PER_STALL + 1):
+                t_cur += 305.0
+                rep_retry, ledger = poll_desktop_hub_auto_retry(
+                    self.ctx,
+                    ledger=ledger,
+                    ps_rows=fake_ps,
+                    rpc_caller=_fake_rpc,
+                    now_epoch=t_cur,
+                )
+                self.assertEqual(rep_retry["resumed_total"], 2)
+                self.assertEqual(rep_retry["resumed_conversations"][0]["attempt"], expected_attempt)
+
+            # Attempt 6 is blocked by MAX_ATTEMPTS_PER_STALL
+            rep_capped, ledger = poll_desktop_hub_auto_retry(
+                self.ctx,
+                ledger=ledger,
+                ps_rows=fake_ps,
+                rpc_caller=_fake_rpc,
+                now_epoch=t_cur + 305.0,
+            )
+            self.assertEqual(rep_capped["resumed_total"], 0)
+
+            # 5. Auth change (user logged out and signed into new@example.com) resets ledger and resumes immediately
+            new_acct_status = json.loads(json.dumps(ready_status))
+            new_acct_status["userStatus"]["email"] = "new@example.com"
+            state_box["user_status"] = new_acct_status
+            rep_relogin, ledger = poll_desktop_hub_auto_retry(
+                self.ctx,
+                ledger=ledger,
+                ps_rows=fake_ps,
+                rpc_caller=_fake_rpc,
+                now_epoch=t_cur + 310.0,
+            )
+            self.assertTrue(rep_relogin["hubs_inspected"][0]["auth_refreshed"])
+            self.assertEqual(rep_relogin["resumed_total"], 2)
+            self.assertEqual(rep_relogin["resumed_conversations"][0]["attempt"], 1)
+
+            # 6. Verify causal RCA incident_stories, hash-chained audit receipts, dry_run + CLI/MCP path
+            stories = {s["root_cause_class"]: s for s in rep_relogin.get("incident_stories") or []}
+            self.assertIn("AUTH_LOGIN_MODEL_GAP", stories)
+            self.assertIn("ACCOUNT_MODEL_MISSING", stories)
+            self.assertEqual(stories["AUTH_LOGIN_MODEL_GAP"]["affected_count"], 1)
+            self.assertEqual(stories["ACCOUNT_MODEL_MISSING"]["resumed_count"], 1)
+
+            rep_dry = recover_desktop_sessions_once(
+                self.ctx,
+                dry_run=True,
+                ps_rows=fake_ps,
+                rpc_caller=_fake_rpc,
+                now_epoch=t_cur + 315.0,
+            )
+            self.assertTrue(rep_dry["dry_run"])
+            self.assertEqual(rep_dry["stalled_total"], 2)
+            self.assertEqual(rep_dry["resumed_total"], 0)
+            audit_file = self.root / "logs" / "recovery-audit.jsonl"
+            self.assertFalse(audit_file.exists())
+
+            rep_live_1 = recover_desktop_sessions_once(
+                self.ctx,
+                dry_run=False,
+                reset_ledger=True,
+                ps_rows=fake_ps,
+                rpc_caller=_fake_rpc,
+                now_epoch=t_cur + 320.0,
+            )
+            self.assertEqual(rep_live_1["resumed_total"], 2)
+            self.assertTrue(rep_live_1.get("audit_receipt_hash"))
+
+            rep_live_2 = recover_desktop_sessions_once(
+                self.ctx,
+                dry_run=False,
+                reset_ledger=True,
+                ps_rows=fake_ps,
+                rpc_caller=_fake_rpc,
+                now_epoch=t_cur + 325.0,
+            )
+            self.assertEqual(rep_live_2["resumed_total"], 2)
+            self.assertTrue(audit_file.is_file())
+            receipt_lines = [
+                json.loads(line)
+                for line in audit_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(receipt_lines), 2)
+            self.assertEqual(receipt_lines[0]["prev_hash"], "GENESIS")
+            self.assertEqual(receipt_lines[1]["prev_hash"], receipt_lines[0]["receipt_hash"])
+            raw_audit = audit_file.read_text(encoding="utf-8")
+            self.assertNotIn("new@example.com", raw_audit)
+            self.assertNotIn("tok-host-999", raw_audit)
+
+        mcp_res = call_tool("session_recover", {"scope": "all", "dry_run": True}, self.ctx)
+        self.assertIn("evidence", mcp_res)
+        self.assertTrue(mcp_res["dry_run"])
+
+        buf_rec = io.StringIO()
+        old_stdout = sys.stdout
+        try:
+            sys.stdout = buf_rec
+            rc_rec = cli_main(["--root", str(self.root), "recover", "--dry-run", "--json"])
+        finally:
+            sys.stdout = old_stdout
+        self.assertEqual(rc_rec, 0)
+        cli_rec = json.loads(buf_rec.getvalue())
+        self.assertTrue(cli_rec["dry_run"])
+        self.assertIn("stalled_total", cli_rec)
 
     def test_bin_wrapper_execution(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

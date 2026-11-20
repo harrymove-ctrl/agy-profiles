@@ -164,12 +164,23 @@ export interface TargetInfo {
   installed: boolean;
 }
 
+export interface AutoRecoverySummary {
+  checked_at: string | null;
+  updated_at: string | null;
+  resumed_total: number;
+  stalled_total: number;
+  watchdog_interval_secs: number | null;
+  last_watchdog_poll_epoch: number | null;
+  guard_checked_at_epoch: number | null;
+}
+
 export interface OverviewResponse {
   root: string;
   default_root: string;
   host_account?: HostAccountInfo;
   host_runtime?: HostRuntimeInfo;
   flow?: QuotaFlowInfo;
+  auto_recovery?: AutoRecoverySummary;
   targets: {
     hub: TargetInfo;
     ide: TargetInfo;
@@ -386,5 +397,24 @@ export interface HealScreenResponse {
   recycled_renderer_pids: number[];
   preserved_root_pids: number[];
   cleared_shader_caches: string[];
+  host_hub_repaired?: boolean;
   healed_at: string;
+}
+
+export interface RecoverSessionsResponse {
+  checked_at: string;
+  cooldown_sec: number;
+  dry_run: boolean;
+  stalled_total: number;
+  resumed_total: number;
+  resumed_conversations: Array<{
+    scope: string;
+    cascade_id: string;
+    title: string;
+    stall_kind: string;
+    mode: string;
+    plan_model: string;
+    attempt: number;
+  }>;
+  evidence?: EvidenceRecord;
 }

@@ -156,7 +156,29 @@ class WebSecurityTests(unittest.TestCase):
 
         status, _, body = self._request("GET", "/api/state", headers={"Cookie": cookie, "X-AGY-CSRF": csrf})
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["profiles"], [])
+        state_payload = json.loads(body)
+        self.assertEqual(state_payload["profiles"], [])
+        self.assertIn("auto_recovery", state_payload)
+
+        # Recover requires Origin and CSRF, and returns 200 JSON when authenticated
+        status, _, _ = self._request(
+            "POST",
+            "/api/recover",
+            headers={"Cookie": cookie, "Origin": self.sec.expected_origin},
+            body={"dry_run": True},
+        )
+        self.assertEqual(status, 403)
+        status, _, body = self._request(
+            "POST",
+            "/api/recover",
+            headers=auth_headers,
+            body={"scope": "all", "dry_run": True},
+        )
+        self.assertEqual(status, 200)
+        recover_payload = json.loads(body)
+        self.assertTrue(recover_payload["dry_run"])
+        self.assertIn("stalled_total", recover_payload)
+        self.assertIn("evidence", recover_payload)
 
         # Create
         status, _, body = self._request(

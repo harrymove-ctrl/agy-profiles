@@ -22,6 +22,9 @@ use quota_watch::{invoke_python_failover_once, TranscriptLogScanner};
 
 const TELEMETRY_FILENAME: &str = ".guard-telemetry.json";
 const LOCK_FILENAME: &str = ".watchdog.lock";
+const DEFAULT_WATCHDOG_INTERVAL_SECS: u64 = 300;
+const AUTH_SETTLE_DELAY_SECS: u64 = 6;
+const MARKER_TRIGGER_DEBOUNCE_SECS: u64 = 20;
 
 struct GuardRuntime {
     uid: u32,
@@ -30,6 +33,10 @@ struct GuardRuntime {
     cpu_sample_cache: HashMap<(u32, u64), (u64, Instant)>,
     tracker: PolicyTracker,
     scanner: TranscriptLogScanner,
+    last_watchdog_poll_epoch: u64,
+    last_marker_trigger_epoch: u64,
+    pending_auth_recovery_at_epoch: Option<u64>,
+    watchdog_interval_secs: u64,
     total_reniced: u64,
     total_reaped: u64,
     total_quota_triggers: u64,
@@ -39,6 +46,8 @@ struct GuardRuntime {
 #[derive(Debug)]
 struct SweepReport {
     checked_at_epoch: u64,
+    last_watchdog_poll_epoch: u64,
+    watchdog_interval_secs: u64,
     ncpu: u32,
     mem_total_mb: u64,
     vm_pressure_level: i32,
@@ -59,7 +68,7 @@ struct SweepReport {
 }
 
 impl GuardRuntime {
-    fn new() -> Self {
+    fn new(watchdog_interval_secs: u64) -> Self {
         Self {
             uid: ffi::current_uid(),
             self_pid: ffi::current_pid(),
@@ -67,6 +76,10 @@ impl GuardRuntime {
             cpu_sample_cache: HashMap::new(),
             tracker: PolicyTracker::default(),
             scanner: TranscriptLogScanner::default(),
+            last_watchdog_poll_epoch: 0,
+            last_marker_trigger_epoch: 0,
+            pending_auth_recovery_at_epoch: None,
+            watchdog_interval_secs: watchdog_interval_secs.max(30),
             total_reniced: 0,
             total_reaped: 0,
             total_quota_triggers: 0,
@@ -221,12 +234,49 @@ impl GuardRuntime {
         self.tracker.prune_dead(&live_ids);
 
         if owns_watchdog_lock {
-            if let Some(marker) = self.scanner.poll_for_quota_signal(host_home, profiles_root) {
+            if let Some(sig) = self.scanner.poll_for_quota_signal(host_home, profiles_root) {
+                if sig.is_auth_refresh {
+                    self.pending_auth_recovery_at_epoch =
+                        Some(now_epoch.saturating_add(AUTH_SETTLE_DELAY_SECS));
+                    self.push_event(format!(
+                        "{}: auth refresh detected ('{}'); recovery scheduled in {}s",
+                        now_epoch, sig.marker, AUTH_SETTLE_DELAY_SECS
+                    ));
+                } else if now_epoch.saturating_sub(self.last_marker_trigger_epoch)
+                    >= MARKER_TRIGGER_DEBOUNCE_SECS
+                {
+                    self.total_quota_triggers += 1;
+                    self.last_marker_trigger_epoch = now_epoch;
+                    self.last_watchdog_poll_epoch = now_epoch;
+                    let ok = invoke_python_failover_once(agyp_bin, profiles_root);
+                    self.push_event(format!(
+                        "{}: quota or error marker '{}' triggered watchdog/auto-retry (ok={})",
+                        now_epoch, sig.marker, ok
+                    ));
+                }
+            }
+            let auth_due = matches!(
+                self.pending_auth_recovery_at_epoch,
+                Some(due) if now_epoch >= due
+            );
+            let periodic_due =
+                now_epoch.saturating_sub(self.last_watchdog_poll_epoch) >= self.watchdog_interval_secs;
+            if auth_due {
+                self.pending_auth_recovery_at_epoch = None;
                 self.total_quota_triggers += 1;
+                self.last_marker_trigger_epoch = now_epoch;
+                self.last_watchdog_poll_epoch = now_epoch;
                 let ok = invoke_python_failover_once(agyp_bin, profiles_root);
                 self.push_event(format!(
-                    "{}: quota marker '{}' triggered failover (ok={})",
-                    now_epoch, marker, ok
+                    "{}: auth refresh recovery triggered watchdog/auto-retry (ok={})",
+                    now_epoch, ok
+                ));
+            } else if periodic_due {
+                self.last_watchdog_poll_epoch = now_epoch;
+                let ok = invoke_python_failover_once(agyp_bin, profiles_root);
+                self.push_event(format!(
+                    "{}: periodic {}s watchdog sweep completed (ok={})",
+                    now_epoch, self.watchdog_interval_secs, ok
                 ));
             }
         }
@@ -240,6 +290,8 @@ impl GuardRuntime {
 
         SweepReport {
             checked_at_epoch: now_epoch,
+            last_watchdog_poll_epoch: self.last_watchdog_poll_epoch,
+            watchdog_interval_secs: self.watchdog_interval_secs,
             ncpu: metrics.ncpu,
             mem_total_mb: metrics.mem_total_bytes / (1024 * 1024),
             vm_pressure_level: metrics.vm_pressure_level,
@@ -288,6 +340,8 @@ fn render_report_json(r: &SweepReport, pid: u32) -> String {
             "  \"engine\": \"rust-agyp-guard\",\n",
             "  \"guard_pid\": {},\n",
             "  \"checked_at_epoch\": {},\n",
+            "  \"last_watchdog_poll_epoch\": {},\n",
+            "  \"watchdog_interval_secs\": {},\n",
             "  \"ncpu\": {},\n",
             "  \"mem_total_mb\": {},\n",
             "  \"vm_pressure_level\": {},\n",
@@ -307,6 +361,8 @@ fn render_report_json(r: &SweepReport, pid: u32) -> String {
         ),
         pid,
         r.checked_at_epoch,
+        r.last_watchdog_poll_epoch,
+        r.watchdog_interval_secs,
         r.ncpu,
         r.mem_total_mb,
         r.vm_pressure_level,
@@ -366,6 +422,11 @@ fn main() {
     let mut root = default_profiles_root(&home);
     let mut agyp_bin = home.join(".local").join("bin").join("agyp");
     let mut interval_secs: f64 = 3.0;
+    let mut watchdog_interval_secs: u64 = env::var("AGY_WATCHDOG_POLL_INTERVAL_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WATCHDOG_INTERVAL_SECS)
+        .max(30);
     let mut as_json = false;
 
     let mut i = 1;
@@ -387,6 +448,13 @@ fn main() {
                 interval_secs = args[i + 1].parse::<f64>().unwrap_or(3.0).max(1.0);
                 i += 2;
             }
+            "--watchdog-interval" if i + 1 < args.len() => {
+                watchdog_interval_secs = args[i + 1]
+                    .parse::<u64>()
+                    .unwrap_or(DEFAULT_WATCHDOG_INTERVAL_SECS)
+                    .max(30);
+                i += 2;
+            }
             "--json" => {
                 as_json = true;
                 i += 1;
@@ -403,14 +471,14 @@ fn main() {
             print!("{}", raw);
             return;
         }
-        let mut rt = GuardRuntime::new();
+        let mut rt = GuardRuntime::new(watchdog_interval_secs);
         let rep = rt.run_sweep(&home, &root, &agyp_bin, false);
         print!("{}", render_report_json(&rep, rt.self_pid));
         return;
     }
 
     if mode == "once" {
-        let mut rt = GuardRuntime::new();
+        let mut rt = GuardRuntime::new(watchdog_interval_secs);
         let rep = rt.run_sweep(&home, &root, &agyp_bin, false);
         let body = render_report_json(&rep, rt.self_pid);
         write_telemetry_atomic(&root, &body);
@@ -454,11 +522,11 @@ fn main() {
     let _ = lock_file.flush();
 
     println!(
-        "AGY Profiles Rust Guardian (agyp-guard pid={}) active every {:.1}s (zero-fork libproc + CPU/GPU QoS).",
-        self_pid, interval_secs
+        "AGY Profiles Rust Guardian (agyp-guard pid={}) active every {:.1}s (watchdog sweep {}s, zero-fork libproc + CPU/GPU QoS).",
+        self_pid, interval_secs, watchdog_interval_secs
     );
 
-    let mut rt = GuardRuntime::new();
+    let mut rt = GuardRuntime::new(watchdog_interval_secs);
     let sleep_dur = Duration::from_secs_f64(interval_secs);
     loop {
         let rep = rt.run_sweep(&home, &root, &agyp_bin, true);

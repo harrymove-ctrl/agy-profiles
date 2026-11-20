@@ -1,14 +1,55 @@
 # agy-profiles
 
-Clean-room multi-profile sandbox manager, stdio MCP server, and hardened localhost console for Google Antigravity on macOS.
+Clean-room multi-account sandbox manager, 24/7 Rust watchdog (`dev.agy-profiles.watchdog`), 5-minute post-logout/login session auto-recovery, zero-`Cmd+Q` black-screen healer, and 18-tool stdio MCP server for Google Antigravity (`Antigravity.app`, `Antigravity IDE.app`, `agy`, and `agy acp`) on macOS.
 
 ![agy-profiles Web Console Overview](docs/assets/web-console-overview.png)
 
 ## Overview
 
-Running multiple accounts, client workspaces, or untrusted repositories inside Google Antigravity Hub and Antigravity IDE risks cross-profile authentication bleed, shell login environment leakage, stale Chromium locks, and unintentional credential exposure. `agy-profiles` solves this through strict directory containment (`0o700` / `0o600`), locked `.zshenv` `HOME` rewriting, fail-closed MCP configuration sanitization, exact `--user-data-dir` process matching, and cryptographic CSRF/Origin isolation on its local web interface.
+Running multiple Google accounts, client workspaces, or untrusted repositories inside Google Antigravity Hub, IDE, or CLI risks cross-profile authentication bleed, shell login environment leakage, stale Chromium locks, black GPU compositor screens, and sudden `Error Unknown: Agent execution terminated due to error.` / `unknown model key MODEL_PLACEHOLDER_*` crashes whenever you log out and log back in after hitting weekly usage limits.
 
-This repository is built purely on the Python 3 standard library (`>= 3.9`) with zero third-party runtime or test dependencies.
+`agy-profiles` solves this in one zero-dependency package (pure Python 3.9+ stdlib plus an optional standalone Rust guardian `agyp-guard`):
+
+1. **Strict Multi-Account Sandbox Isolation**: `0o700` / `0o600` directories, immutable `.zshenv` `HOME` locking, fail-closed MCP secret scrubbing, and exact `--user-data-dir` PID boundary matching.
+2. **5-Minute and Post-Login Watchdog Recovery (`dev.agy-profiles.watchdog`)**: Detects hidden `CORTEX_STEP_TYPE_ERROR_MESSAGE` termination steps via live Hub RPC (`GetCascadeTrajectorySteps`), waits for `fetchAvailableModels` readiness (`clientModelConfigs`), switches missing models safely, resets retry state on account change, and resumes stalled threads automatically every 5 minutes plus 6 seconds after login.
+3. **Causal Watchdog RCA and Tamper-Evident Receipts**: Collapses correlated crashes into `incident_stories` (`AUTH_LOGIN_MODEL_GAP`, `ACCOUNT_MODEL_MISSING`, `HTTP2_STREAM_DROP`, `FIVE_HOUR_QUOTA_PAUSE`) and records `0o600` SHA-256 hash-chained receipts in `logs/recovery-audit.jsonl`.
+4. **Zero-`Cmd+Q` Black-Screen Healer (`agyp heal`)**: Purges stale Metal/Dawn shader caches and recycles `--type=gpu-process` helpers while keeping running agents and terminals alive.
+5. **18-Tool MCP, CLI, TUI, and Aux Pane Console**: Exposes `session_recover`, `profile_switch`, `host_handoff`, `system_doctor`, and `obligations_verify` across CLI (`agyp`), stdio MCP, ASCII TUI (`agyp top`), and a CSRF-hardened Astryx Web Console (`127.0.0.1:47920`).
+
+## Why agy-profiles vs Basic Account Switchers
+
+| Capability | Basic CLI Token Switchers | `agy-profiles` (`v0.3.0`) |
+| :--- | :--- | :--- |
+| **Targets Supported** | Single CLI binary | Antigravity Hub, Antigravity IDE, `agy` CLI, and `agy acp` |
+| **Logout/Login Crash Recovery** | Manual prompt re-entry | 5m + 6s post-login auto-recovery (`agyp recover` / `dev.agy-profiles.watchdog`) |
+| **Hidden RPC Error Detection** | None | Inspects `GetCascadeTrajectorySteps` even when `transcript.jsonl` looks clean |
+| **Causal RCA & Audit Trail** | None | `incident_stories` grouping + `0o600` hash-chained `recovery-audit.jsonl` |
+| **GPU / Black-Screen Heal** | Requires full `Cmd+Q` restart | `agyp heal` recycles GPU helpers with zero session loss |
+| **CPU / Orphan PID Guardian** | None | Native Rust `agyp-guard` (`renice`, Darwin QoS, orphan reaper, `caffeinate -i`) |
+| **Runtime Dependencies** | Node / npm packages | Zero runtime PyPI or npm dependencies |
+
+## Post-Logout/Login Auto-Recovery (`dev.agy-profiles.watchdog`)
+
+When switching accounts in Main Antigravity after exhausting weekly usage, active threads and `/schedule` crons frequently fail with `failed to construct executor: unknown model key MODEL_PLACEHOLDER_*: model not found`. Install the 24/7 watchdog or enable the bundled [Antigravity Plugin](antigravity-plugin/README.md) so stalled threads recover automatically:
+
+```bash
+# Install 24/7 macOS launchd services (Rust agyp-guard + caffeinate + Web Console)
+agyp daemon install --no-open --json
+
+# Check live watchdog, lock, and Web Console health
+agyp daemon status --json
+
+# Inspect errored Desktop Hub threads without modifying state
+agyp recover --dry-run --json
+
+# Resume errored threads immediately after an account switch
+agyp recover --reset-ledger --json
+
+# Run agy ACP inside an isolated sandbox profile (compatible with pi-antigravity-acp-provider)
+agyp agy core-research -- acp
+```
+
+Read the full deep dive in [Watchdog and Post-Logout Session Auto-Recovery](docs/WATCHDOG_AND_RECOVERY.md).
 
 ## Key Capabilities
 
@@ -18,7 +59,7 @@ This repository is built purely on the Python 3 standard library (`>= 3.9`) with
 4. **Symlink Allowlist and Blocklist**: Rejects and strips symlinks pointing to sensitive host locations (`.ssh`, `.gnupg`, `.aws`, `.kube`, `.npmrc`, `.netrc`, `.pypirc`, `Library/Keychains`, `.gemini`, shell startup dotfiles). Offers opt-in link policies (`none`, `minimal`, `dev` default on CLI) for benign runtime binaries, `.agents` shared rules under `dev`, and fonts.
 5. **Exact Process Boundary Matching**: Tracks and stops processes only when `--user-data-dir=<resolved_path>` matches at strict token boundaries, including descendant child processes discovered via parent-PID traversal. Escalates cleanly from `SIGTERM` to `SIGKILL` and repairs stale Chromium locks (`SingletonLock`, `SingletonSocket`, `SingletonCookie`, `DevToolsActivePort`).
 6. **Evidence, Accounts, and Obligation Ledgers**: Detects signed-in Host and sandbox Google account emails without leaking tokens, emits structured `EvidenceRecord` metadata (`evidence_id`, `authority`, `confidence`, `facts`, `limitations`) on inspections, verifies `.app` code signatures on Apple Silicon, and exposes six executable security self-checks via `agy-profiles obligations`.
-7. **Zero-Dependency Local Surfaces and Antigravity Plugin**: Includes an `argparse` CLI (`agy-profiles` / `agyp`) with one-command `switch`, a stdio JSON-RPC 2.0 MCP server exposing 17 tools (`agy-profiles mcp`), ad-hoc signed macOS `.app` launchers (`agy-profiles launcher build`), a native Antigravity Hub Aux Pane plugin (`antigravity-plugin/` installed via `./install.sh --with-plugin`), and an Astryx Design System Web Console (`agy-profiles web`) with `Gothic Studio`, `Gothic`, and `Neutral` themes.
+7. **Zero-Dependency Local Surfaces and Antigravity Plugin**: Includes an `argparse` CLI (`agy-profiles` / `agyp`) with one-command `switch` and `recover`, a stdio JSON-RPC 2.0 MCP server exposing 18 tools (`agy-profiles mcp`), ad-hoc signed macOS `.app` launchers (`agy-profiles launcher build`), a native Antigravity Hub Aux Pane plugin (`antigravity-plugin/` installed via `./install.sh --with-plugin` with a built-in 5-minute recovery loop), and an Astryx Design System Web Console (`agy-profiles web`) with `Gothic Studio`, `Gothic`, and `Neutral` themes.
 
 ## Installation
 
@@ -143,29 +184,33 @@ This updates `src/agy_profiles/web_static/` directly for packaging and verificat
 | `agy-profiles launcher build\|remove <name>` | Compile and ad-hoc sign (or remove) a macOS `.app` bundle using `osacompile` and `codesign`. |
 | `agy-profiles doctor [--json]` | Inspect host Antigravity binaries, `.app` signatures, storage root modes, and stale locks. |
 | `agy-profiles obligations [--json]` | Execute and report all six live security obligation checks. |
-| `agy-profiles mcp` | Serve 17 tools over line-delimited JSON-RPC 2.0 stdio. |
+| `agy-profiles mcp` | Serve 18 tools over line-delimited JSON-RPC 2.0 stdio (`session_recover` included). |
+| `agy-profiles recover [--dry-run] [--reset-ledger] [--scope all]` | Inspect Desktop Hub trajectories via live RPC for auth, model, stream, or quota errors and resume them. |
 | `agy-profiles web [--host 127.0.0.1] [--port 47920] [--sidecar]` | Start the CSRF-guarded local web console or Antigravity Aux Pane sidecar service. |
 | `agyp daemon [install\|status\|open\|restart\|uninstall]` | Install and manage persistent 24/7 macOS `launchd` services (`agyp-guard` Rust guardian wrapped in `caffeinate -i` plus the loopback Web Console). |
 | `agyp guard [status\|once] [--json]` | Inspect or run the zero-dependency native Rust CPU, GPU, unified memory, and orphan PID guardian (`rust/agyp-guard`). |
 | `agyp heal [all\|host\|<name>] [--target hub\|ide\|all] [--deep]` | Recover black Antigravity windows without `Cmd+Q` by purging Metal/Dawn shader caches and recycling `--type=gpu-process` while keeping all running sessions and `language_server` alive. |
 | `agyp watchdog [--interval 5] [--once]` | Poll active logs and automatically switch quota, clickable sessions, and Automations onto the standby profile on exhaustion. |
-| `agyp auto` / `agyp agy <name>` | Run terminal `agy` CLI with Turbo permissions, Antigravity Mobile remote control, and mid-session automatic quota failover. |
+| `agyp auto` / `agyp agy <name>` | Run terminal `agy` (or `agy acp`) with Turbo permissions, Antigravity Mobile remote control, and mid-session automatic quota failover. |
 | `agy-profiles watch` / `agyp top` `[--theme sacred\|gothic\|catppuccin\|amber\|ascii] [--once] [--redact] [--export-svg <path>]` | Run the zero-dependency SRCL and WebTUI inspired ASCII terminal telemetry dashboard or export dark-mode SVG cards for X and GitHub. |
 
 ## Verification and Testing
 
-Run the full zero-dependency test suite across Python 3.9 and 3.14, plus the secret and contamination scanner:
+Run the full zero-dependency test suite across Python 3.9 and 3.14, Rust guardian tests, and the secret and contamination scanner:
 
 ```bash
 python3 -m unittest discover -s tests -v
+cargo test --manifest-path rust/agyp-guard/Cargo.toml
 python3 scripts/check_secrets.py
 ```
 
-## Documentation
+## Documentation and Architecture References
 
-1. [Architecture Overview](docs/ARCHITECTURE.md): Five-layer clean-room module design, shell isolation rationale, and lock lifecycle.
-2. [Reconstruction Obligations](docs/OBLIGATIONS.md): Live invariant definitions verified on every release.
-3. [Security Model](SECURITY.md): Threat model, CSP/CSRF controls, symlink jail, and fail-closed redaction guarantees.
+1. [Watchdog and Post-Logout Session Auto-Recovery](docs/WATCHDOG_AND_RECOVERY.md): `dev.agy-profiles.watchdog` internals, `GetCascadeTrajectorySteps` RPC detection, causal RCA stories, and hash-chained `recovery-audit.jsonl` receipts.
+2. [Architecture Overview](docs/ARCHITECTURE.md): Five-layer clean-room module design, shell isolation rationale, and lock lifecycle.
+3. [Reconstruction Obligations](docs/OBLIGATIONS.md): Live invariant definitions verified on every release.
+4. [Security Model](SECURITY.md): Threat model, CSP/CSRF controls, symlink jail, and fail-closed redaction guarantees.
+5. **External Research and Ecosystem Context**: Built with inspiration from independent watchdog design (`arXiv:2608.21841`), Datadog Watchdog causal RCA grouping, NVIDIA Open Agent Safety Platform out-of-band audit guarantees, and ACP (`agy acp` / `pi-antigravity-acp-provider`) multi-account isolation.
 
 ## License
 

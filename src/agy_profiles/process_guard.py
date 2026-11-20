@@ -45,6 +45,13 @@ LOCK_FILENAMES: Tuple[str, ...] = (
     "DevToolsActivePort",
 )
 
+# Bundled Antigravity Language Server localhost certificate SPKI SHA-256 pin.
+# Passing --ignore-certificate-errors-spki-list=<pin> to Electron ensures Chromium
+# propagates the pin to every respawned NetworkService utility process so
+# https://127.0.0.1:<port> never fails with ERR_CERT_AUTHORITY_INVALID.
+AGY_LS_CERT_SPKI_PIN = "JeyXQw7kf/EFhXkPlmSMOr8ABBItZp+OzlpjMuFUdas="
+AGY_LS_CERT_SPKI_FLAG = "--ignore-certificate-errors-spki-list={}".format(AGY_LS_CERT_SPKI_PIN)
+
 _PROCESS_TYPE_RE = re.compile(r"(?:^|\s)--type=")
 _USER_DATA_DIR_FLAG_RE = re.compile(r"(?:^|\s)--user-data-dir(?:=|\s)")
 
@@ -369,7 +376,11 @@ def launch_profile(
     sandbox_home = ensure_within_root(verified_profile, verified_profile / "home")
     data_dir = ensure_within_root(verified_profile, verified_profile / DATA_SUBDIR_BY_TARGET[chosen_target])
 
-    cmd: List[str] = [target_info.binary_path, "--user-data-dir={}".format(str(data_dir))]
+    cmd: List[str] = [
+        target_info.binary_path,
+        "--user-data-dir={}".format(str(data_dir)),
+        AGY_LS_CERT_SPKI_FLAG,
+    ]
     if chosen_target == "ide":
         ext_dir = ensure_within_root(sandbox_home, sandbox_home / ".antigravity-ide" / "extensions")
         ext_dir.mkdir(parents=True, exist_ok=True)
@@ -655,7 +666,14 @@ def repair_host_hub(
         }
         if sys.platform == "darwin" and Path("/usr/bin/open").exists():
             proc = subprocess.run(
-                ["/usr/bin/open", "-n", "-a", hub_info.app_path],
+                [
+                    "/usr/bin/open",
+                    "-n",
+                    "-a",
+                    hub_info.app_path,
+                    "--args",
+                    AGY_LS_CERT_SPKI_FLAG,
+                ],
                 env=clean_env,
                 cwd=str(host_home),
                 stdin=subprocess.DEVNULL,
@@ -673,7 +691,7 @@ def repair_host_hub(
             launched = True
         elif hub_info.binary_path:
             subprocess.Popen(
-                [hub_info.binary_path],
+                [hub_info.binary_path, AGY_LS_CERT_SPKI_FLAG],
                 env=clean_env,
                 cwd=str(host_home),
                 stdin=subprocess.DEVNULL,
@@ -805,6 +823,13 @@ def heal_electron_compositor(
     if recycled_gpu_pids or recycled_renderer_pids:
         time.sleep(0.35)
 
+    host_hub_repaired = False
+    if ps_rows is None and scope in ("host", "all") and "hub" in targets:
+        tls_check = inspect_host_hub_tls_health(real_home=base_home)
+        if tls_check.get("tls_broken"):
+            repair_host_hub(real_home=base_home, launch=True)
+            host_hub_repaired = True
+
     return {
         "scope": scope,
         "target": target,
@@ -813,5 +838,6 @@ def heal_electron_compositor(
         "recycled_renderer_pids": recycled_renderer_pids,
         "preserved_root_pids": preserved_roots,
         "cleared_shader_caches": cleared_caches,
+        "host_hub_repaired": host_hub_repaired,
         "healed_at": utc_now_iso(),
     }
