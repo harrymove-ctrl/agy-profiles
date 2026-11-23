@@ -1566,6 +1566,251 @@ class McpAndCliTests(unittest.TestCase):
             report = json.loads(proc.stdout)
             self.assertEqual(report["summary"]["failed"], 0)
 
+    def test_transcript_fallback_email_switch_and_503_agentapi_recovery(self) -> None:
+        from agy_profiles.quota_guard import (
+            MODEL_CAPACITY_CONTINUATION_PROMPT,
+            PENDING_HUB_RECOVERY_FILENAME,
+            recover_desktop_sessions_once,
+        )
+
+        app_dir = self.fake_home / "Library" / "Application Support" / "Antigravity"
+        app_dir.mkdir(parents=True, exist_ok=True)
+        (app_dir / "app_storage.json").write_text(
+            json.dumps({"agy.onboarding.lastLoginUsername": "new@gmail.com"}),
+            encoding="utf-8",
+        )
+
+        brain_dir = self.fake_home / ".gemini" / "antigravity" / "brain"
+        root_cid = "11111111-1111-4111-8111-111111111111"
+        sub_cid = "22222222-2222-4222-8222-222222222222"
+
+        root_log = brain_dir / root_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        root_log.parent.mkdir(parents=True, exist_ok=True)
+        root_log.write_text(
+            "\n".join(
+                [
+                    json.dumps({"step_index": 1, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "<USER_REQUEST>ship prod fix</USER_REQUEST>"}),
+                    json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "source": "MODEL", "status": "DONE", "content": "working"}),
+                    json.dumps({"step_index": 3, "type": "ERROR_MESSAGE", "source": "SYSTEM", "error": "API error (attempt 8): UNAVAILABLE (code 503): No capacity available for model gemini-4-hydrogen-xhigh"}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        sub_log = brain_dir / sub_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        sub_log.parent.mkdir(parents=True, exist_ok=True)
+        sub_log.write_text(
+            "\n".join(
+                [
+                    json.dumps({"step_index": 1, "type": "USER_INPUT", "source": "USER", "content": "Subagent task"}),
+                    json.dumps({"step_index": 2, "type": "ERROR_MESSAGE", "source": "SYSTEM", "error": "RESOURCE_EXHAUSTED (code 429)"}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        old_ts = 1_795_400_000.0
+        for p in (root_log, sub_log):
+            os.utime(str(p), (old_ts, old_ts))
+
+        # Seed prior ledger under old email and exhausted attempt cap so email switch resets it.
+        (self.root / ".quota-watchdog.json").write_text(
+            json.dumps(
+                {
+                    "desktop_retry_ledger": {
+                        "__auth_state__": {"host": {"email": "old@gmail.com", "signed_in": True, "can_dispatch_now": True}},
+                        f"host:{root_cid}": {"attempts": 5, "updated_at_epoch": old_ts, "last_good_step": 2},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def _fake_probe(_home: Path) -> dict:
+            return {
+                "models_loaded": True,
+                "available_models": {"gemini-pro-orchestrator": None, "gemini-4-carbon-high": None},
+                "preferred_plan_model": "gemini-pro-orchestrator",
+            }
+
+        def _meta_check(cid: str):
+            return cid == root_cid
+
+        dry = recover_desktop_sessions_once(
+            self.ctx,
+            dry_run=True,
+            ps_rows=[],
+            now_epoch=old_ts + 60.0,
+            transcript_fallback=True,
+            cli_models_probe=_fake_probe,
+            metadata_checker=_meta_check,
+        )
+        self.assertTrue(dry["hubs_inspected"][0]["auth_refreshed"])
+        self.assertEqual(dry["hubs_inspected"][0]["email"], "new@gmail.com")
+        self.assertEqual(dry["stalled_total"], 1)
+        self.assertEqual(dry["incident_stories"][0]["root_cause_class"], "MODEL_CAPACITY_503")
+        self.assertEqual(dry["resumed_total"], 0)
+
+        # Without ANTIGRAVITY_LS_ADDRESS / agentapi_sender, host desktop threads are queued cleanly.
+        old_ls = os.environ.pop("ANTIGRAVITY_LS_ADDRESS", None)
+        try:
+            queued_res = recover_desktop_sessions_once(
+                self.ctx,
+                dry_run=False,
+                ps_rows=[],
+                now_epoch=old_ts + 65.0,
+                transcript_fallback=True,
+                cli_models_probe=_fake_probe,
+                metadata_checker=_meta_check,
+            )
+            self.assertEqual(queued_res["resumed_total"], 0)
+            pending_doc = json.loads((self.root / PENDING_HUB_RECOVERY_FILENAME).read_text(encoding="utf-8"))
+            self.assertIn(root_cid, pending_doc)
+        finally:
+            if old_ls is not None:
+                os.environ["ANTIGRAVITY_LS_ADDRESS"] = old_ls
+
+        # Now switch to a second new email with agentapi sender -> ledger resets and dispatches immediately.
+        (app_dir / "app_storage.json").write_text(
+            json.dumps({"agy.onboarding.lastLoginUsername": "third@gmail.com"}),
+            encoding="utf-8",
+        )
+        sent: list[tuple[str, str]] = []
+        live_res = recover_desktop_sessions_once(
+            self.ctx,
+            dry_run=False,
+            ps_rows=[],
+            now_epoch=old_ts + 120.0,
+            transcript_fallback=True,
+            cli_models_probe=_fake_probe,
+            metadata_checker=_meta_check,
+            agentapi_sender=lambda cid, text: sent.append((cid, text)) or {"ok": True},
+        )
+        self.assertEqual(live_res["resumed_total"], 1)
+        self.assertEqual(sent[0][0], root_cid)
+        self.assertEqual(sent[0][1], MODEL_CAPACITY_CONTINUATION_PROMPT)
+        self.assertEqual(live_res["resumed_conversations"][0]["mode"], "agentapi_send_message")
+        pending_after = json.loads((self.root / PENDING_HUB_RECOVERY_FILENAME).read_text(encoding="utf-8"))
+        self.assertNotIn(root_cid, pending_after)
+
+    def test_recovery_hook_stop_capacity_and_session_start(self) -> None:
+        import importlib.util
+
+        repo_root = Path(__file__).resolve().parents[1]
+        hook_path = repo_root / "antigravity-plugin" / "hooks" / "agy-recovery-hook.py"
+        spec = importlib.util.spec_from_file_location("agy_recovery_hook", str(hook_path))
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        cid = "33333333-3333-4333-8333-333333333333"
+        old_no_spawn = os.environ.get("AGY_HOOK_NO_SPAWN")
+        os.environ["AGY_HOOK_NO_SPAWN"] = "1"
+        try:
+            # Allow path: Stop on 503 capacity error auto-continues up to 2 times.
+            res1 = mod.handle_hook_event(
+                {
+                    "conversationId": cid,
+                    "terminationReason": "ERROR",
+                    "error": "UNAVAILABLE (code 503): No capacity available",
+                    "continuationActive": False,
+                },
+                event="Stop",
+                root_dir=self.root,
+                home_dir=self.fake_home,
+                now_ts=1_795_400_000.0,
+            )
+            self.assertEqual(res1.get("decision"), "continue")
+            queue_doc = json.loads((self.root / ".stalled-queue.json").read_text(encoding="utf-8"))
+            self.assertIn(cid, queue_doc)
+
+            # Anti-loop block 1: continuationActive=True must stop cleanly.
+            res_loop = mod.handle_hook_event(
+                {
+                    "conversationId": cid,
+                    "terminationReason": "ERROR",
+                    "error": "UNAVAILABLE (code 503): No capacity available",
+                    "continuationActive": True,
+                },
+                event="Stop",
+                root_dir=self.root,
+                home_dir=self.fake_home,
+                now_ts=1_795_400_010.0,
+            )
+            self.assertEqual(res_loop, {})
+
+            # Second retry succeeds; 3rd inside 600s is capped to prevent runaway loop.
+            res2 = mod.handle_hook_event(
+                {
+                    "conversationId": cid,
+                    "terminationReason": "ERROR",
+                    "error": "UNAVAILABLE (code 503): No capacity available",
+                    "continuationActive": False,
+                },
+                event="Stop",
+                root_dir=self.root,
+                home_dir=self.fake_home,
+                now_ts=1_795_400_020.0,
+            )
+            self.assertEqual(res2.get("decision"), "continue")
+            res3 = mod.handle_hook_event(
+                {
+                    "conversationId": cid,
+                    "terminationReason": "ERROR",
+                    "error": "UNAVAILABLE (code 503): No capacity available",
+                    "continuationActive": False,
+                },
+                event="Stop",
+                root_dir=self.root,
+                home_dir=self.fake_home,
+                now_ts=1_795_400_030.0,
+            )
+            self.assertEqual(res3, {})
+
+            # USER_CANCELED and quota 429 must never trigger Stop-hook infinite loop.
+            self.assertEqual(
+                mod.handle_hook_event(
+                    {"conversationId": "4444", "terminationReason": "USER_CANCELED"},
+                    event="Stop",
+                    root_dir=self.root,
+                    home_dir=self.fake_home,
+                    now_ts=1_795_400_040.0,
+                ),
+                {},
+            )
+            self.assertEqual(
+                mod.handle_hook_event(
+                    {"conversationId": "5555", "terminationReason": "ERROR", "error": "RESOURCE_EXHAUSTED (code 429)"},
+                    event="Stop",
+                    root_dir=self.root,
+                    home_dir=self.fake_home,
+                    now_ts=1_795_400_050.0,
+                ),
+                {},
+            )
+
+            # SessionStart returns {} cleanly even with email change + queued items.
+            app_dir = self.fake_home / "Library" / "Application Support" / "Antigravity"
+            app_dir.mkdir(parents=True, exist_ok=True)
+            (app_dir / "app_storage.json").write_text(
+                json.dumps({"agy.onboarding.lastLoginUsername": "fresh@gmail.com"}),
+                encoding="utf-8",
+            )
+            sess_res = mod.handle_hook_event(
+                {"conversationId": cid},
+                event="SessionStart",
+                root_dir=self.root,
+                home_dir=self.fake_home,
+                now_ts=1_795_400_060.0,
+            )
+            self.assertEqual(sess_res, {})
+        finally:
+            if old_no_spawn is None:
+                os.environ.pop("AGY_HOOK_NO_SPAWN", None)
+            else:
+                os.environ["AGY_HOOK_NO_SPAWN"] = old_no_spawn
+
 
 if __name__ == "__main__":
     unittest.main()

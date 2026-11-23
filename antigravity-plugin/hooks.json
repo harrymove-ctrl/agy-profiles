@@ -1,0 +1,18 @@
+{
+  "agy-profiles-recovery": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 ./hooks/agy-recovery-hook.py --event SessionStart",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./hooks/agy-recovery-hook.py --event Stop",
+        "timeout": 10
+      }
+    ]
+  }
+}

@@ -19,6 +19,10 @@ const QUOTA_MARKERS: &[&str] = &[
     "credit balance is too low",
     "run out of credit",
     "exhausted your capacity",
+    "no capacity available",
+    "unavailable (code 503)",
+    "overloaded",
+    "model capacity",
     "stream idle timeout",
     "context deadline exceeded",
     "encountered an error and has either stopped",
@@ -39,7 +43,63 @@ pub struct LogSignal {
 #[derive(Default)]
 pub struct TranscriptLogScanner {
     offsets: HashMap<PathBuf, u64>,
+    last_host_email: Option<String>,
     initialized: bool,
+}
+
+fn extract_json_string_after_key(raw: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let idx = raw.find(&needle)?;
+    let after_key = &raw[idx + needle.len()..];
+    let colon_idx = after_key.find(':')?;
+    let mut rest = after_key[colon_idx + 1..].trim_start();
+    if !rest.starts_with('"') {
+        return None;
+    }
+    rest = &rest[1..];
+    let mut out = String::new();
+    let mut escaped = false;
+    for ch in rest.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            let trimmed = out.trim().to_string();
+            return if trimmed.is_empty() { None } else { Some(trimmed) };
+        }
+        out.push(ch);
+    }
+    None
+}
+
+fn read_host_app_storage_email(host_home: &Path) -> Option<String> {
+    let app_storage = host_home
+        .join("Library")
+        .join("Application Support")
+        .join("Antigravity")
+        .join("app_storage.json");
+    if !app_storage.is_file() {
+        return None;
+    }
+    let meta = fs::symlink_metadata(&app_storage).ok()?;
+    if meta.file_type().is_symlink() || meta.len() > 2 * 1024 * 1024 {
+        return None;
+    }
+    let raw = fs::read_to_string(&app_storage).ok()?;
+    for key in ["agy.onboarding.lastLoginUsername", "lastLoginUsername", "email", "username"] {
+        if let Some(val) = extract_json_string_after_key(&raw, key) {
+            if val.contains('@') {
+                return Some(val);
+            }
+        }
+    }
+    None
 }
 
 impl TranscriptLogScanner {
@@ -106,11 +166,24 @@ impl TranscriptLogScanner {
                     self.offsets.insert(p, meta.len());
                 }
             }
+            self.last_host_email = read_host_app_storage_email(host_home);
             self.initialized = true;
             return None;
         }
 
         let mut matched_signal: Option<LogSignal> = None;
+        if let Some(cur_email) = read_host_app_storage_email(host_home) {
+            if self.last_host_email.as_deref() != Some(cur_email.as_str()) {
+                let changed_from_prev = self.last_host_email.is_some();
+                self.last_host_email = Some(cur_email);
+                if changed_from_prev {
+                    matched_signal = Some(LogSignal {
+                        marker: "app_storage_email_changed".to_string(),
+                        is_auth_refresh: true,
+                    });
+                }
+            }
+        }
         for p in paths {
             let Ok(meta) = fs::metadata(&p) else {
                 continue;
@@ -273,6 +346,57 @@ mod tests {
                 is_auth_refresh: true,
             })
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detects_503_model_capacity_and_app_storage_email_switch() {
+        let tmp = std::env::temp_dir().join(format!("agyp_guard_email_503_{}", std::process::id()));
+        let home_dir = tmp.join("home");
+        let app_dir = home_dir.join("Library").join("Application Support").join("Antigravity");
+        let ls_dir = home_dir.join("Library").join("Logs").join("Antigravity");
+        let root_dir = tmp.join("profiles");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::create_dir_all(&ls_dir).unwrap();
+        fs::create_dir_all(&root_dir).unwrap();
+
+        let app_storage = app_dir.join("app_storage.json");
+        fs::write(&app_storage, "{\"agy.onboarding.lastLoginUsername\":\"old@gmail.com\"}").unwrap();
+        let ls_log = ls_dir.join("language_server.log");
+        fs::write(&ls_log, "").unwrap();
+
+        let mut scanner = TranscriptLogScanner::default();
+        assert_eq!(scanner.poll_for_quota_signal(&home_dir, &root_dir), None);
+
+        // 503 No capacity available triggers fast quota/error marker.
+        {
+            let mut fh = fs::OpenOptions::new().append(true).open(&ls_log).unwrap();
+            writeln!(fh, "UNAVAILABLE (code 503): No capacity available for model gemini-4-hydrogen-xhigh").unwrap();
+            fh.flush().unwrap();
+        }
+        let hit_503 = scanner.poll_for_quota_signal(&home_dir, &root_dir);
+        assert_eq!(
+            hit_503,
+            Some(LogSignal {
+                marker: "no capacity available".to_string(),
+                is_auth_refresh: false,
+            })
+        );
+
+        // Email change in app_storage.json triggers is_auth_refresh = true.
+        fs::write(&app_storage, "{\"agy.onboarding.lastLoginUsername\":\"new@gmail.com\"}").unwrap();
+        let hit_email = scanner.poll_for_quota_signal(&home_dir, &root_dir);
+        assert_eq!(
+            hit_email,
+            Some(LogSignal {
+                marker: "app_storage_email_changed".to_string(),
+                is_auth_refresh: true,
+            })
+        );
+        // Subsequent poll without change -> None.
+        assert_eq!(scanner.poll_for_quota_signal(&home_dir, &root_dir), None);
 
         let _ = fs::remove_dir_all(&tmp);
     }

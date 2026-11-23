@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import ssl
 import subprocess
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import urllib.error
 import urllib.request
 
 from agy_profiles.config import atomic_write_json, ensure_within_root
 from agy_profiles.evidence import compute_sha256, utc_now_iso
+from agy_profiles.isolation import detect_host_account
 from agy_profiles.process_guard import command_matches_user_data_dir, list_all_processes
 
 try:
@@ -58,6 +62,28 @@ AUTH_RECOVERY_CONTINUATION_PROMPT = (
     "Antigravity session or auth refreshed after an execution error. Resume your active task from where you left off, "
     "check whether any background tasks, /schedule timers, or subagents stopped, re-arm them if needed, and continue."
 )
+MODEL_CAPACITY_CONTINUATION_PROMPT = (
+    "Previous turn stopped on model capacity or quota limits after account/session recovery. Resume your active task from where "
+    "you left off; if a model or subagent hit 503 or 429, switch to an available healthy model (such as gemini-pro-orchestrator "
+    "or flash), re-arm any stopped subagents or /schedule timers, and continue."
+)
+
+STALL_TRANSCRIPT_ERROR_RE = re.compile(
+    r"(?:resource_exhausted|quota\s+reached|quota\s+exhausted|unknown\s+model\s+key|failed\s+to\s+construct\s+executor|"
+    r"not\s+logged\s+into\s+antigravity|agent\s+execution\s+terminated\s+due\s+to\s+error|"
+    r"http2:\s*server\s+sent\s+goaway|stream\s+reading\s+error|no\s+capacity\s+available|"
+    r"unavailable\s*\(code\s*503\)|context\s+deadline\s+exceeded)",
+    re.IGNORECASE,
+)
+PREFERRED_HEALTHY_MODELS = (
+    "gemini-pro-orchestrator",
+    "gemini-4-carbon-high",
+    "gemini-4-neon-high",
+    "gemini-3.8-flash-high",
+    "gemini-4-hydrogen-high",
+)
+STALLED_QUEUE_FILENAME = ".stalled-queue.json"
+PENDING_HUB_RECOVERY_FILENAME = ".pending-hub-recovery.json"
 
 
 def _resolve_retry_cooldown_sec(cooldown_sec: Optional[int] = None) -> int:
@@ -394,11 +420,372 @@ def classify_stall_root_cause(item: Dict[str, Any], quota_info: Dict[str, Any]) 
         if gen_model and isinstance(avail, dict) and avail and gen_model not in avail:
             return "ACCOUNT_MODEL_MISSING"
         return "AUTH_LOGIN_MODEL_GAP"
+    if "no capacity available" in stall_reason or "unavailable (code 503)" in stall_reason or "overloaded" in stall_reason or "model capacity" in stall_reason:
+        return "MODEL_CAPACITY_503"
     if "goaway" in stall_reason or "stream" in stall_reason or "deadline" in stall_reason:
         return "HTTP2_STREAM_DROP"
     if stall_kind in ("subagent_or_swarm_quota", "interrupted_after_tool"):
         return "TOOL_HOOK_INTERRUPT"
     return "EXECUTION_ERROR"
+
+
+def _find_agy_bin(real_home: Optional[Path] = None) -> Optional[str]:
+    """Locate the official Antigravity CLI (`agy`) binary without shell indirection."""
+    env_bin = os.environ.get("AGY_CLI_BIN", "").strip()
+    if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+        return env_bin
+    if real_home is not None:
+        candidate = real_home / ".local" / "bin" / "agy"
+        if candidate.is_file() and os.access(str(candidate), os.X_OK):
+            return str(candidate)
+    return shutil.which("agy")
+
+
+def _find_agentapi_bin(real_home: Optional[Path] = None) -> Optional[str]:
+    """Locate the official Antigravity `agentapi` IPC helper binary."""
+    env_bin = os.environ.get("AGY_AGENTAPI_BIN", "").strip()
+    if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+        return env_bin
+    if real_home is not None:
+        candidate = real_home / ".gemini" / "antigravity" / "bin" / "agentapi"
+        if candidate.is_file() and os.access(str(candidate), os.X_OK):
+            return str(candidate)
+    return shutil.which("agentapi")
+
+
+def _probe_agy_cli_models(real_home: Optional[Path] = None) -> Dict[str, Any]:
+    """Query `agy models` using official Antigravity CLI to detect available non-exhausted models."""
+    agy_bin = _find_agy_bin(real_home)
+    if not agy_bin:
+        return {
+            "models_loaded": False,
+            "available_models": {},
+            "preferred_plan_model": PREFERRED_HEALTHY_MODELS[0],
+        }
+    env = dict(os.environ)
+    if real_home is not None:
+        env["HOME"] = str(real_home.resolve())
+    try:
+        proc = subprocess.run(
+            [agy_bin, "models"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=12.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {
+            "models_loaded": False,
+            "available_models": {},
+            "preferred_plan_model": PREFERRED_HEALTHY_MODELS[0],
+        }
+    if proc.returncode != 0:
+        return {
+            "models_loaded": False,
+            "available_models": {},
+            "preferred_plan_model": PREFERRED_HEALTHY_MODELS[0],
+        }
+    available_models: Dict[str, Optional[float]] = {}
+    for line in (proc.stdout or "").splitlines():
+        s = line.strip()
+        if not s or s.lower().startswith("fetching available models"):
+            continue
+        model_id = s.split("\t", 1)[0].split()[0].strip()
+        if model_id and re.match(r"^[A-Za-z0-9._-]+$", model_id):
+            available_models[model_id] = None
+    preferred = PREFERRED_HEALTHY_MODELS[0]
+    for cand in PREFERRED_HEALTHY_MODELS:
+        if cand in available_models:
+            preferred = cand
+            break
+    else:
+        if available_models:
+            preferred = next(iter(available_models))
+    return {
+        "models_loaded": len(available_models) > 0,
+        "available_models": available_models,
+        "preferred_plan_model": preferred,
+    }
+
+
+def _agentapi_is_root_conversation(agentapi_bin: str, cid: str) -> Optional[bool]:
+    """Return True if `cid` is a root conversation via `agentapi get-conversation-metadata`, False if subagent."""
+    if not os.environ.get("ANTIGRAVITY_LS_ADDRESS"):
+        return None
+    try:
+        proc = subprocess.run(
+            [agentapi_bin, "get-conversation-metadata", cid],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        payload = json.loads(proc.stdout or "{}")
+        meta = (((payload.get("response") or {}).get("conversationMetadata") or {}).get("metadata") or {})
+        parent_id = str(meta.get("parentConversationId") or "").strip()
+        return not bool(parent_id)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _resume_via_agentapi(agentapi_bin: str, cid: str, prompt: str) -> Dict[str, Any]:
+    """Resume a stalled Desktop Hub conversation via sanctioned `agentapi send-message`."""
+    proc = subprocess.run(
+        [agentapi_bin, "send-message", cid, prompt],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=15.0,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise OSError((proc.stderr or proc.stdout or "agentapi send-message failed").strip()[:180])
+    return {"mode": "agentapi_send_message", "stdout": (proc.stdout or "").strip()[:240]}
+
+
+@contextmanager
+def _recovery_mutex(root_dir: Path) -> Iterator[None]:
+    """Serialize live state reads/dispatches/writes across watchdog, hook, and CLI invocations."""
+    root_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = ensure_within_root(root_dir, root_dir / ".recover.lock")
+    if lock_path.is_symlink():
+        yield
+        return
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _active_cli_conversation_ids() -> set[str]:
+    """Return conversation UUIDs currently active in detached `agy --conversation` processes."""
+    active: set[str] = set()
+    try:
+        rows = list_all_processes()
+    except OSError:
+        return active
+    for r in rows:
+        cmd = str(r.get("command") or "")
+        if "--conversation" not in cmd:
+            continue
+        m = re.search(r"--conversation\s+([0-9a-fA-F-]{8,64})", cmd)
+        if m:
+            active.add(m.group(1))
+    return active
+
+
+def _resume_cli_conversation_detached(agy_bin: str, cid: str, model: str, prompt: str, real_home: Optional[Path] = None) -> Dict[str, Any]:
+    """Resume an Antigravity CLI conversation detached via official `agy --conversation` with bounded timeout."""
+    env = dict(os.environ)
+    if real_home is not None:
+        env["HOME"] = str(real_home.resolve())
+    subprocess.Popen(
+        [agy_bin, "--conversation", cid, "--model", model, "--print-timeout", "300s", "--print", prompt],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return {"mode": "agy_cli_detached", "plan_model": model}
+
+
+def _read_root_json_map(root_dir: Path, filename: str) -> Dict[str, Any]:
+    fp = ensure_within_root(root_dir, root_dir / filename)
+    if not fp.is_file() or fp.is_symlink():
+        return {}
+    try:
+        data = json.loads(fp.read_text(encoding="utf-8", errors="replace"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_root_json_map(root_dir: Path, filename: str, data: Dict[str, Any]) -> None:
+    fp = ensure_within_root(root_dir, root_dir / filename)
+    atomic_write_json(fp, data, mode=0o600)
+
+
+def _extract_short_title(steps: List[Dict[str, Any]], cid: str) -> str:
+    for st in steps:
+        if st.get("type") == "USER_INPUT":
+            raw = str(st.get("content") or "")
+            raw = re.sub(r"</?(?:USER_REQUEST|ADDITIONAL_METADATA|CONTEXT_SUMMARY)[^>]*>", " ", raw)
+            cleaned = " ".join(raw.split()).strip()
+            if cleaned:
+                return cleaned[:72]
+    return cid
+
+
+def _find_transcript_stalled_conversations(
+    root_dir: Path,
+    real_home: Path,
+    now_ts: float,
+    lookback_hours: float,
+    min_idle_age_sec: float = 20.0,
+    metadata_checker: Optional[Callable[[str], Optional[bool]]] = None,
+) -> List[Dict[str, Any]]:
+    """Detect stalled Host root conversations from transcript.jsonl and .stalled-queue.json."""
+    max_age_sec = float(lookback_hours) * 3600.0
+    stalled_queue = _read_root_json_map(root_dir, STALLED_QUEUE_FILENAME)
+    candidate_paths: Dict[str, Tuple[Path, bool]] = {}
+
+    for sub in (".gemini/antigravity/brain", ".gemini/antigravity-cli/brain"):
+        bdir = real_home / sub
+        is_cli_store = "antigravity-cli" in sub
+        if not bdir.is_dir():
+            continue
+        try:
+            for conv_dir in sorted(bdir.iterdir()):
+                t_file = conv_dir / ".system_generated" / "logs" / "transcript.jsonl"
+                if t_file.is_file() and not t_file.is_symlink():
+                    candidate_paths[conv_dir.name] = (t_file, is_cli_store)
+        except OSError:
+            continue
+
+    agentapi_bin = _find_agentapi_bin(real_home)
+    has_ls_addr = bool(os.environ.get("ANTIGRAVITY_LS_ADDRESS"))
+    check_root_fn: Optional[Callable[[str], Optional[bool]]] = metadata_checker
+    if check_root_fn is None and agentapi_bin and has_ls_addr:
+        check_root_fn = lambda cid_arg: _agentapi_is_root_conversation(agentapi_bin, cid_arg)  # noqa: E731
+
+    candidates: List[Dict[str, Any]] = []
+    seen_cids: set[str] = set()
+
+    # Combine transcript files and explicit hook-queued stalls.
+    all_cids = list(candidate_paths.keys()) + [k for k in stalled_queue.keys() if k not in candidate_paths]
+    for cid in all_cids:
+        if cid in seen_cids:
+            continue
+        q_item = stalled_queue.get(cid) if isinstance(stalled_queue.get(cid), dict) else None
+        t_info = candidate_paths.get(cid)
+        t_path = t_info[0] if t_info else None
+        is_cli_store = t_info[1] if t_info else False
+
+        mtime_epoch: Optional[float] = None
+        if t_path is not None:
+            try:
+                mtime_epoch = float(t_path.stat().st_mtime)
+            except OSError:
+                mtime_epoch = None
+        if mtime_epoch is None and q_item is not None:
+            try:
+                mtime_epoch = float(q_item.get("recorded_at_epoch") or 0.0) or now_ts
+            except (TypeError, ValueError):
+                mtime_epoch = now_ts
+        if mtime_epoch is None:
+            continue
+
+        idle_age = now_ts - mtime_epoch
+        if idle_age > max_age_sec:
+            continue
+
+        head_steps: List[Dict[str, Any]] = []
+        tail_steps: List[Dict[str, Any]] = []
+        if t_path is not None:
+            try:
+                size = int(t_path.stat().st_size)
+                with t_path.open("rb") as fh:
+                    raw_head = fh.read(16384).decode("utf-8", errors="replace")
+                    if size > 32768:
+                        fh.seek(size - 32768)
+                        raw_tail = fh.read(32768).decode("utf-8", errors="replace")
+                    else:
+                        raw_tail = raw_head
+                for raw_blk, target in ((raw_head, head_steps), (raw_tail, tail_steps)):
+                    for ln in raw_blk.splitlines():
+                        s = ln.strip()
+                        if not s.startswith("{"):
+                            continue
+                        try:
+                            obj = json.loads(s)
+                            if isinstance(obj, dict) and obj.get("source") != "SYSTEM_SDK":
+                                target.append(obj)
+                        except ValueError:
+                            continue
+            except OSError:
+                pass
+
+        last = tail_steps[-1] if tail_steps else {}
+        last_type = str(last.get("type") or "")
+        last_src = str(last.get("source") or "")
+        last_error = str(last.get("error") or "")
+        last_content = str(last.get("content") or "")
+        step_count = int(last.get("step_index") or len(tail_steps) or (q_item or {}).get("step_count") or 0)
+
+        stall_kind: Optional[str] = None
+        stall_reason: Optional[str] = None
+        needs_prompt_bypass = True
+
+        if last_type == "ERROR_MESSAGE":
+            stall_kind = "auth_or_model_error" if AUTH_OR_MODEL_ERROR_RE.search(last_error) else "error_message"
+            stall_reason = (last_error or last_content or "Agent execution terminated due to error.")[:180]
+        elif last_src == "SYSTEM" and last_type == "SYSTEM_MESSAGE" and STALL_TRANSCRIPT_ERROR_RE.search(last_content):
+            stall_kind = "subagent_or_swarm_quota"
+            stall_reason = last_content.replace("\n", " ")[:180]
+        elif q_item is not None and not (last_type == "PLANNER_RESPONSE" and last.get("status") == "DONE" and float(last.get("step_index") or 0) > float(q_item.get("step_index") or -1)):
+            q_err = str(q_item.get("error") or q_item.get("termination_reason") or "Hook recorded execution error")
+            stall_kind = "auth_or_model_error" if AUTH_OR_MODEL_ERROR_RE.search(q_err) else "error_message"
+            stall_reason = q_err[:180]
+
+        if stall_kind is None:
+            continue
+        effective_min_idle = 3.0 if q_item is not None or last_type == "ERROR_MESSAGE" else min_idle_age_sec
+        if idle_age < effective_min_idle:
+            continue
+
+        # Filter out subagents (authoritative agentapi metadata when available, else first-step check).
+        is_root: Optional[bool] = check_root_fn(cid) if check_root_fn is not None else None
+        if is_root is False:
+            continue
+        if is_root is None and head_steps:
+            first_user = next((str(x.get("content") or "") for x in head_steps if x.get("type") == "USER_INPUT"), "")
+            looks_root = "<USER_REQUEST>" in first_user or len(head_steps) > 12
+            if not looks_root and q_item is None:
+                continue
+
+        last_good_step = 0
+        for st in tail_steps:
+            if st.get("type") == "PLANNER_RESPONSE" and st.get("status") == "DONE":
+                try:
+                    last_good_step = max(last_good_step, int(st.get("step_index") or 0))
+                except (TypeError, ValueError):
+                    pass
+
+        seen_cids.add(cid)
+        cli_pb = real_home / ".gemini" / "antigravity-cli" / "conversations" / "{}.pb".format(cid)
+        candidates.append(
+            {
+                "cascade_id": str(cid),
+                "title": _extract_short_title(head_steps or tail_steps, str(cid)),
+                "is_subagent": False,
+                "parent_id": None,
+                "step_count": step_count,
+                "last_good_step": last_good_step,
+                "generator_model": None,
+                "termination_reason": str((q_item or {}).get("termination_reason") or "ERROR"),
+                "stall_kind": stall_kind,
+                "stall_reason": stall_reason,
+                "needs_prompt_bypass": needs_prompt_bypass,
+                "idle_age_sec": round(max(0.0, idle_age), 1),
+                "has_cli_pb": bool(is_cli_store or cli_pb.is_file()),
+                "source_store": "antigravity_cli" if (is_cli_store or cli_pb.is_file()) else "desktop_hub",
+            }
+        )
+
+    candidates.sort(key=lambda item: item["idle_age_sec"])
+    return candidates
 
 
 def build_incident_stories(hubs_report: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -794,6 +1181,10 @@ def poll_desktop_hub_auto_retry(
     dry_run: bool = False,
     reset_ledger: bool = False,
     lookback_hours: float = 12.0,
+    transcript_fallback: Optional[bool] = None,
+    cli_models_probe: Optional[Callable[[Path], Dict[str, Any]]] = None,
+    agentapi_sender: Optional[Callable[[str, str], Dict[str, Any]]] = None,
+    metadata_checker: Optional[Callable[[str], Optional[bool]]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Inspect all running Antigravity Desktop Hub servers and auto-resume stalled or errored conversations."""
     now_ts = float(time.time() if now_epoch is None else now_epoch)
@@ -816,7 +1207,8 @@ def poll_desktop_hub_auto_retry(
         if not isinstance(entry, dict) or (now_ts - float(entry.get("updated_at_epoch") or 0.0)) > 86400.0:
             next_ledger.pop(k, None)
 
-    if ps_rows is None and rpc_caller is None and not _is_real_host_context(ctx):
+    allow_fallback = _is_real_host_context(ctx) if transcript_fallback is None else bool(transcript_fallback)
+    if ps_rows is None and rpc_caller is None and not allow_fallback:
         return (
             {
                 "checked_at": utc_now_iso(),
@@ -834,7 +1226,8 @@ def poll_desktop_hub_auto_retry(
         )
 
     caller = rpc_caller or _call_hub_ls_rpc
-    servers = discover_desktop_hub_servers(Path(ctx.root).resolve(), ctx.real_home, ps_rows=ps_rows)
+    root_dir = Path(ctx.root).resolve()
+    servers = discover_desktop_hub_servers(root_dir, ctx.real_home, ps_rows=ps_rows)
     hubs_report: List[Dict[str, Any]] = []
     resumed_all: List[Dict[str, Any]] = []
     stalled_total = 0
@@ -842,6 +1235,200 @@ def poll_desktop_hub_auto_retry(
     host_5h_reset_time: Optional[str] = None
     host_weekly_exhausted = False
     host_weekly_reset_time: Optional[str] = None
+
+    if not servers and allow_fallback and (not scope_filter or scope_filter in ("all", "host")):
+        host_home = (ctx.real_home if getattr(ctx, "real_home", None) is not None else _os_user_home()).resolve()
+        host_acct = detect_host_account(real_home=host_home)
+        cur_email = str(host_acct.get("email") or "")
+        model_probe = (
+            cli_models_probe(host_home)
+            if cli_models_probe is not None
+            else _probe_agy_cli_models(host_home)
+        )
+        models_loaded = bool(model_probe.get("models_loaded"))
+        available_models = model_probe.get("available_models") or {}
+        preferred_model = str(model_probe.get("preferred_plan_model") or PREFERRED_HEALTHY_MODELS[0])
+        cur_signed_in = bool(cur_email)
+        cur_can_dispatch = bool(cur_signed_in and models_loaded)
+
+        prev_scope_auth = prev_auth_map.get("host") if isinstance(prev_auth_map.get("host"), dict) else {}
+        prev_email = str(prev_scope_auth.get("email") or "")
+        prev_signed_in = prev_scope_auth.get("signed_in")
+        prev_can_dispatch = prev_scope_auth.get("can_dispatch_now")
+        auth_refreshed = bool(
+            (prev_email and cur_email and prev_email != cur_email)
+            or (prev_signed_in is False and cur_signed_in is True)
+            or (prev_can_dispatch is False and cur_can_dispatch is True)
+        )
+        if not dry_run:
+            cur_auth_map["host"] = {
+                "email": cur_email,
+                "signed_in": cur_signed_in,
+                "can_dispatch_now": cur_can_dispatch,
+                "models_loaded": models_loaded,
+                "updated_at_epoch": now_ts,
+            }
+            if auth_refreshed or reset_ledger:
+                for lk in [key for key in next_ledger if key != "__auth_state__" and key.startswith("host:")]:
+                    next_ledger.pop(lk, None)
+
+        quota_info = {
+            "signed_in": cur_signed_in,
+            "email": cur_email,
+            "weekly_remaining": None,
+            "five_hour_remaining": None,
+            "five_hour_reset_time": None,
+            "argon_weekly_remaining": None,
+            "five_hour_exhausted_while_weekly_available": False,
+            "weekly_exhausted": False,
+            "can_dispatch_now": cur_can_dispatch,
+            "models_loaded": models_loaded,
+            "available_models": available_models,
+            "preferred_plan_model": preferred_model,
+        }
+        stalled = _find_transcript_stalled_conversations(
+            root_dir,
+            host_home,
+            now_ts,
+            lookback_hours,
+            metadata_checker=metadata_checker,
+        )
+        for item in stalled:
+            item["root_cause_class"] = classify_stall_root_cause(item, quota_info)
+        stalled_total += len(stalled)
+
+        agentapi_bin = _find_agentapi_bin(host_home)
+        agy_bin = _find_agy_bin(host_home)
+        can_agentapi = (agentapi_sender is not None) or (
+            bool(os.environ.get("ANTIGRAVITY_LS_ADDRESS")) and bool(agentapi_bin)
+        )
+        resumed_here: List[Dict[str, Any]] = []
+        pending_hub_map = _read_root_json_map(root_dir, PENDING_HUB_RECOVERY_FILENAME)
+        stalled_queue_map = _read_root_json_map(root_dir, STALLED_QUEUE_FILENAME)
+        queue_changed = False
+        pending_changed = False
+
+        if cur_can_dispatch and not dry_run:
+            active_cli_cids = _active_cli_conversation_ids()
+            cli_dispatched = 0
+            for item in stalled:
+                cid = str(item["cascade_id"])
+                step_count = int(item["step_count"])
+                last_good_step = int(item.get("last_good_step") or 0)
+                ledger_key = "host:{}".format(cid)
+                prev_entry = next_ledger.get(ledger_key) if isinstance(next_ledger.get(ledger_key), dict) else {}
+                if auth_refreshed or reset_ledger:
+                    attempts = 0
+                    last_try = 0.0
+                else:
+                    attempts = int(prev_entry.get("attempts") or 0)
+                    last_try = float(prev_entry.get("updated_at_epoch") or 0.0)
+                    prev_good_step = int(prev_entry.get("last_good_step") or 0)
+                    if last_good_step > prev_good_step:
+                        attempts = 0
+
+                if attempts >= MAX_ATTEMPTS_PER_STALL:
+                    continue
+                if attempts > 0 and (now_ts - last_try) < float(eff_cooldown):
+                    continue
+
+                cont_text = (
+                    MODEL_CAPACITY_CONTINUATION_PROMPT
+                    if item["root_cause_class"] == "MODEL_CAPACITY_503"
+                    else AUTH_RECOVERY_CONTINUATION_PROMPT
+                )
+                dispatch_mode: Optional[str] = None
+                try:
+                    if item.get("has_cli_pb") and agy_bin:
+                        if cid in active_cli_cids or cli_dispatched >= 3:
+                            continue
+                        _resume_cli_conversation_detached(
+                            agy_bin,
+                            cid,
+                            preferred_model,
+                            cont_text,
+                            real_home=host_home,
+                        )
+                        cli_dispatched += 1
+                        dispatch_mode = "agy_cli_detached"
+                    elif can_agentapi:
+                        if agentapi_sender is not None:
+                            agentapi_sender(cid, cont_text)
+                        else:
+                            _resume_via_agentapi(str(agentapi_bin), cid, cont_text)
+                        dispatch_mode = "agentapi_send_message"
+                    else:
+                        pending_hub_map[cid] = {
+                            "cascade_id": cid,
+                            "root_cause_class": item["root_cause_class"],
+                            "stall_reason": item["stall_reason"],
+                            "queued_at_epoch": now_ts,
+                        }
+                        pending_changed = True
+                        continue
+                except (OSError, ValueError):
+                    continue
+
+                next_ledger[ledger_key] = {
+                    "attempts": attempts + 1,
+                    "updated_at_epoch": now_ts,
+                    "last_step_count": step_count,
+                    "last_good_step": last_good_step,
+                    "mode": dispatch_mode,
+                    "stall_kind": item["stall_kind"],
+                    "root_cause_class": item["root_cause_class"],
+                    "email": cur_email,
+                }
+                if cid in stalled_queue_map:
+                    stalled_queue_map.pop(cid, None)
+                    queue_changed = True
+                if cid in pending_hub_map:
+                    pending_hub_map.pop(cid, None)
+                    pending_changed = True
+
+                resumed_entry = {
+                    "scope": "host",
+                    "cascade_id": cid,
+                    "title": item["title"],
+                    "step_count": step_count,
+                    "last_good_step": last_good_step,
+                    "stall_kind": item["stall_kind"],
+                    "root_cause_class": item["root_cause_class"],
+                    "mode": dispatch_mode,
+                    "plan_model": preferred_model,
+                    "attempt": attempts + 1,
+                }
+                resumed_here.append(resumed_entry)
+                resumed_all.append(resumed_entry)
+
+            if queue_changed:
+                _write_root_json_map(root_dir, STALLED_QUEUE_FILENAME, stalled_queue_map)
+            if pending_changed:
+                _write_root_json_map(root_dir, PENDING_HUB_RECOVERY_FILENAME, pending_hub_map)
+
+        hubs_report.append(
+            {
+                "scope": "host",
+                "transport": "agentapi" if can_agentapi else "transcript_fallback",
+                "reachable": True,
+                "signed_in": cur_signed_in,
+                "email": cur_email,
+                "models_loaded": models_loaded,
+                "auth_refreshed": auth_refreshed,
+                "cooldown_sec": eff_cooldown,
+                "weekly_remaining": None,
+                "five_hour_remaining": None,
+                "five_hour_reset_time": None,
+                "argon_weekly_remaining": None,
+                "five_hour_exhausted_while_weekly_available": False,
+                "can_dispatch_now": cur_can_dispatch,
+                "preferred_plan_model": preferred_model,
+                "stalled_count": len(stalled),
+                "stalled_conversations": stalled,
+                "resumed_conversations": resumed_here,
+                "pending_hub_dispatch_count": len(pending_hub_map),
+            }
+        )
 
     for srv in servers:
         scope = str(srv["scope"])
@@ -1044,6 +1631,10 @@ def recover_desktop_sessions_once(
     ps_rows: Optional[List[Dict[str, Any]]] = None,
     rpc_caller: Optional[Callable[..., Dict[str, Any]]] = None,
     now_epoch: Optional[float] = None,
+    transcript_fallback: Optional[bool] = None,
+    cli_models_probe: Optional[Callable[[Path], Dict[str, Any]]] = None,
+    agentapi_sender: Optional[Callable[[str, str], Dict[str, Any]]] = None,
+    metadata_checker: Optional[Callable[[str], Optional[bool]]] = None,
 ) -> Dict[str, Any]:
     """Inspect Desktop Hub sessions and resume errored or stalled conversations without profile failover."""
     root_dir = Path(ctx.root).resolve()
@@ -1051,48 +1642,53 @@ def recover_desktop_sessions_once(
     os.chmod(str(root_dir), 0o700)
     state_file = ensure_within_root(root_dir, root_dir / ".quota-watchdog.json")
 
-    prev_state: Dict[str, Any] = {}
-    if state_file.is_file() and not state_file.is_symlink():
-        try:
-            loaded = json.loads(state_file.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                prev_state = loaded
-        except (OSError, ValueError):
-            pass
+    with _recovery_mutex(root_dir):
+        prev_state: Dict[str, Any] = {}
+        if state_file.is_file() and not state_file.is_symlink():
+            try:
+                loaded = json.loads(state_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    prev_state = loaded
+            except (OSError, ValueError):
+                pass
 
-    prev_ledger = prev_state.get("desktop_retry_ledger")
-    desktop_retry, next_ledger = poll_desktop_hub_auto_retry(
-        ctx,
-        ledger=prev_ledger if isinstance(prev_ledger, dict) else {},
-        ps_rows=ps_rows,
-        rpc_caller=rpc_caller,
-        now_epoch=now_epoch,
-        cooldown_sec=cooldown_sec,
-        scope_filter=scope,
-        dry_run=dry_run,
-        reset_ledger=reset_ledger,
-        lookback_hours=lookback_hours,
-    )
+        prev_ledger = prev_state.get("desktop_retry_ledger")
+        desktop_retry, next_ledger = poll_desktop_hub_auto_retry(
+            ctx,
+            ledger=prev_ledger if isinstance(prev_ledger, dict) else {},
+            ps_rows=ps_rows,
+            rpc_caller=rpc_caller,
+            now_epoch=now_epoch,
+            cooldown_sec=cooldown_sec,
+            scope_filter=scope,
+            dry_run=dry_run,
+            reset_ledger=reset_ledger,
+            lookback_hours=lookback_hours,
+            transcript_fallback=transcript_fallback,
+            cli_models_probe=cli_models_probe,
+            agentapi_sender=agentapi_sender,
+            metadata_checker=metadata_checker,
+        )
 
-    if not dry_run:
-        receipt = append_recovery_audit_receipt(root_dir, desktop_retry)
-        if receipt is not None:
-            desktop_retry["audit_receipt_hash"] = receipt["receipt_hash"]
-        updated_state = dict(prev_state)
-        updated_state["desktop_retry_ledger"] = next_ledger
-        updated_state["last_desktop_auto_retry"] = {
-            "checked_at": desktop_retry.get("checked_at"),
-            "resumed_total": desktop_retry.get("resumed_total", 0),
-            "stalled_total": desktop_retry.get("stalled_total", 0),
-            "incident_stories": desktop_retry.get("incident_stories") or [],
-            "resumed_conversations": desktop_retry.get("resumed_conversations") or [],
-            "host_five_hour_exhausted_only": desktop_retry.get("host_five_hour_exhausted_only", False),
-            "host_five_hour_reset_time": desktop_retry.get("host_five_hour_reset_time"),
-        }
-        updated_state["updated_at"] = utc_now_iso()
-        atomic_write_json(state_file, updated_state, mode=0o600)
+        if not dry_run:
+            receipt = append_recovery_audit_receipt(root_dir, desktop_retry)
+            if receipt is not None:
+                desktop_retry["audit_receipt_hash"] = receipt["receipt_hash"]
+            updated_state = dict(prev_state)
+            updated_state["desktop_retry_ledger"] = next_ledger
+            updated_state["last_desktop_auto_retry"] = {
+                "checked_at": desktop_retry.get("checked_at"),
+                "resumed_total": desktop_retry.get("resumed_total", 0),
+                "stalled_total": desktop_retry.get("stalled_total", 0),
+                "incident_stories": desktop_retry.get("incident_stories") or [],
+                "resumed_conversations": desktop_retry.get("resumed_conversations") or [],
+                "host_five_hour_exhausted_only": desktop_retry.get("host_five_hour_exhausted_only", False),
+                "host_five_hour_reset_time": desktop_retry.get("host_five_hour_reset_time"),
+            }
+            updated_state["updated_at"] = utc_now_iso()
+            atomic_write_json(state_file, updated_state, mode=0o600)
 
-    return desktop_retry
+        return desktop_retry
 
 
 def host_quota_log_paths(real_home: Optional[Path] = None) -> List[Path]:
@@ -1182,105 +1778,106 @@ def poll_auto_failover_once(
     os.chmod(str(root_dir), 0o700)
     state_file = ensure_within_root(root_dir, root_dir / ".quota-watchdog.json")
 
-    prev_state: Dict[str, Any] = {}
-    first_boot = True
-    if state_file.is_file() and not state_file.is_symlink():
-        try:
-            loaded = json.loads(state_file.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                prev_state = loaded
-                first_boot = False
-        except (OSError, ValueError):
-            pass
+    with _recovery_mutex(root_dir):
+        prev_state: Dict[str, Any] = {}
+        first_boot = True
+        if state_file.is_file() and not state_file.is_symlink():
+            try:
+                loaded = json.loads(state_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    prev_state = loaded
+                    first_boot = False
+            except (OSError, ValueError):
+                pass
 
-    paths = host_quota_log_paths(ctx.real_home)
-    raw_offsets = prev_state.get("offsets")
-    offsets: Dict[str, int] = (
-        {str(k): int(v) for k, v in raw_offsets.items() if isinstance(v, (int, float))}
-        if isinstance(raw_offsets, dict)
-        else {}
-    )
-
-    triggered, reason, next_offsets = scan_new_log_bytes_for_quota_exhaustion(
-        paths,
-        offsets,
-        initialize_at_eof=first_boot,
-    )
-
-    prev_ledger = prev_state.get("desktop_retry_ledger")
-    desktop_retry, next_ledger = poll_desktop_hub_auto_retry(
-        ctx,
-        ledger=prev_ledger if isinstance(prev_ledger, dict) else {},
-    )
-    receipt = append_recovery_audit_receipt(root_dir, desktop_retry)
-    if receipt is not None:
-        desktop_retry["audit_receipt_hash"] = receipt["receipt_hash"]
-
-    allow_5h_failover = bool(
-        failover_on_5h and os.environ.get("AGY_FAILOVER_ON_5H", "1").strip().lower() not in ("0", "false", "no")
-    )
-    if not triggered and desktop_retry.get("host_weekly_exhausted"):
-        triggered = True
-        reason = "Weekly Limit exhausted on Host Desktop Hub (resets at {})".format(
-            desktop_retry.get("host_weekly_reset_time") or "unknown"
-        )
-    elif (
-        not triggered
-        and allow_5h_failover
-        and desktop_retry.get("host_five_hour_exhausted_only")
-    ):
-        triggered = True
-        reason = "Five Hour Limit exhausted on Host Desktop Hub (resets at {})".format(
-            desktop_retry.get("host_five_hour_reset_time") or "unknown"
+        paths = host_quota_log_paths(ctx.real_home)
+        raw_offsets = prev_state.get("offsets")
+        offsets: Dict[str, int] = (
+            {str(k): int(v) for k, v in raw_offsets.items() if isinstance(v, (int, float))}
+            if isinstance(raw_offsets, dict)
+            else {}
         )
 
-    overview = call_tool_fn("profile_list", {}, ctx)
-    flow = overview.get("flow") or {}
-    profiles = overview.get("profiles") or []
-    active_owner = str(flow.get("active_owner") or "host")
+        triggered, reason, next_offsets = scan_new_log_bytes_for_quota_exhaustion(
+            paths,
+            offsets,
+            initialize_at_eof=first_boot,
+        )
 
-    switched_to: Optional[str] = None
-    switch_result: Optional[Dict[str, Any]] = None
-    if triggered and active_owner == "host" and profiles:
-        target_slug = str(profiles[0]["manifest"]["name"])
-        switch_result = call_tool_fn(
-            "profile_switch",
-            {
-                "name": target_slug,
-                "automations_mode": "active",
-                "include_sessions": True,
-                "copy_prompt": copy_prompt,
-                "launch": launch,
-            },
+        prev_ledger = prev_state.get("desktop_retry_ledger")
+        desktop_retry, next_ledger = poll_desktop_hub_auto_retry(
             ctx,
+            ledger=prev_ledger if isinstance(prev_ledger, dict) else {},
         )
-        switched_to = target_slug
+        receipt = append_recovery_audit_receipt(root_dir, desktop_retry)
+        if receipt is not None:
+            desktop_retry["audit_receipt_hash"] = receipt["receipt_hash"]
 
-    new_state = {
-        "offsets": next_offsets,
-        "desktop_retry_ledger": next_ledger,
-        "last_desktop_auto_retry": {
-            "checked_at": desktop_retry.get("checked_at"),
-            "resumed_total": desktop_retry.get("resumed_total", 0),
-            "stalled_total": desktop_retry.get("stalled_total", 0),
-            "incident_stories": desktop_retry.get("incident_stories") or [],
-            "resumed_conversations": desktop_retry.get("resumed_conversations") or [],
-            "host_five_hour_exhausted_only": desktop_retry.get("host_five_hour_exhausted_only", False),
-            "host_five_hour_reset_time": desktop_retry.get("host_five_hour_reset_time"),
-        },
-        "updated_at": utc_now_iso(),
-        "last_triggered_at": utc_now_iso() if switched_to else prev_state.get("last_triggered_at"),
-        "last_reason": reason if switched_to else prev_state.get("last_reason"),
-        "last_switched_to": switched_to or prev_state.get("last_switched_to"),
-    }
-    atomic_write_json(state_file, new_state, mode=0o600)
-    return {
-        "checked_at": new_state["updated_at"],
-        "initialized": first_boot,
-        "quota_exhausted_detected": triggered,
-        "reason": reason,
-        "active_owner_before": active_owner,
-        "switched_to": switched_to,
-        "switch": switch_result,
-        "desktop_auto_retry": desktop_retry,
-    }
+        allow_5h_failover = bool(
+            failover_on_5h and os.environ.get("AGY_FAILOVER_ON_5H", "1").strip().lower() not in ("0", "false", "no")
+        )
+        if not triggered and desktop_retry.get("host_weekly_exhausted"):
+            triggered = True
+            reason = "Weekly Limit exhausted on Host Desktop Hub (resets at {})".format(
+                desktop_retry.get("host_weekly_reset_time") or "unknown"
+            )
+        elif (
+            not triggered
+            and allow_5h_failover
+            and desktop_retry.get("host_five_hour_exhausted_only")
+        ):
+            triggered = True
+            reason = "Five Hour Limit exhausted on Host Desktop Hub (resets at {})".format(
+                desktop_retry.get("host_five_hour_reset_time") or "unknown"
+            )
+
+        overview = call_tool_fn("profile_list", {}, ctx)
+        flow = overview.get("flow") or {}
+        profiles = overview.get("profiles") or []
+        active_owner = str(flow.get("active_owner") or "host")
+
+        switched_to: Optional[str] = None
+        switch_result: Optional[Dict[str, Any]] = None
+        if triggered and active_owner == "host" and profiles:
+            target_slug = str(profiles[0]["manifest"]["name"])
+            switch_result = call_tool_fn(
+                "profile_switch",
+                {
+                    "name": target_slug,
+                    "automations_mode": "active",
+                    "include_sessions": True,
+                    "copy_prompt": copy_prompt,
+                    "launch": launch,
+                },
+                ctx,
+            )
+            switched_to = target_slug
+
+        new_state = {
+            "offsets": next_offsets,
+            "desktop_retry_ledger": next_ledger,
+            "last_desktop_auto_retry": {
+                "checked_at": desktop_retry.get("checked_at"),
+                "resumed_total": desktop_retry.get("resumed_total", 0),
+                "stalled_total": desktop_retry.get("stalled_total", 0),
+                "incident_stories": desktop_retry.get("incident_stories") or [],
+                "resumed_conversations": desktop_retry.get("resumed_conversations") or [],
+                "host_five_hour_exhausted_only": desktop_retry.get("host_five_hour_exhausted_only", False),
+                "host_five_hour_reset_time": desktop_retry.get("host_five_hour_reset_time"),
+            },
+            "updated_at": utc_now_iso(),
+            "last_triggered_at": utc_now_iso() if switched_to else prev_state.get("last_triggered_at"),
+            "last_reason": reason if switched_to else prev_state.get("last_reason"),
+            "last_switched_to": switched_to or prev_state.get("last_switched_to"),
+        }
+        atomic_write_json(state_file, new_state, mode=0o600)
+        return {
+            "checked_at": new_state["updated_at"],
+            "initialized": first_boot,
+            "quota_exhausted_detected": triggered,
+            "reason": reason,
+            "active_owner_before": active_owner,
+            "switched_to": switched_to,
+            "switch": switch_result,
+            "desktop_auto_retry": desktop_retry,
+        }
